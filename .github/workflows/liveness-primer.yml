@@ -9,7 +9,7 @@ concurrency:
 
 env:
   LIVENESS_PRIMER_REF: 4aceddaf6b290d3ba8abe2c6ab07926d84fd601b
-  PYTHON_VERSION: "3.14"
+  PYTHON_VERSION: "3.13"
 
 permissions:
   contents: read
@@ -36,19 +36,20 @@ jobs:
           cache-dependency-glob: _liveness_primer/pyproject.toml
 
       - name: Compare Skylos revisions across the corpus
-        run: >-
-          uvx --from ./_liveness_primer
-          liveness-primer run
-          --tool skylos
-          --repo "${{ github.server_url }}/${{ github.repository }}"
-          --old "${{ github.event.pull_request.base.sha }}"
-          --new "${{ github.event.pull_request.head.sha }}"
-          --all
-          --corpus ./_liveness_primer/corpus.toml
-          --output github
-          --jobs 2
-          --timeout 300
-          | tee liveness-primer-report.md
+        run: |
+          set -o pipefail
+          uvx --from ./_liveness_primer \
+            liveness-primer run \
+            --tool skylos \
+            --repo "${{ github.server_url }}/${{ github.repository }}" \
+            --old "${{ github.event.pull_request.base.sha }}" \
+            --new "${{ github.event.pull_request.head.sha }}" \
+            --all \
+            --corpus ./_liveness_primer/corpus.toml \
+            --output github \
+            --jobs 2 \
+            --timeout 300 \
+            | tee liveness-primer-report.md
 
       - name: Upload liveness_primer report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
