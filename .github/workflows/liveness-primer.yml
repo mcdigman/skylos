@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LIVENESS_PRIMER_REF: 4aceddaf6b290d3ba8abe2c6ab07926d84fd601b
+  LIVENESS_PRIMER_REF: human_readable_reporting
   PYTHON_VERSION: "3.13"
 
 permissions:
