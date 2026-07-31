@@ -35,6 +35,11 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache-dependency-glob: _liveness_primer/pyproject.toml
 
+      # The markdown rendering is only useful once it reaches the run
+      # Summary page; writing it to a file alone leaves the job log showing
+      # raw markdown and the Summary empty. --json-out archives the
+      # CI-consumable JSON product from the same corpus run, so the report
+      # is not paid for twice.
       - name: Compare Skylos revisions across the corpus
         run: |
           set -o pipefail
@@ -47,13 +52,16 @@ jobs:
             --all \
             --corpus ./_liveness_primer/corpus.toml \
             --output github \
+            --json-out liveness-primer-report.json \
             --jobs 2 \
             --timeout 300 \
-            | tee liveness-primer-report.md
+            | tee liveness-primer-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload liveness_primer report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: liveness-primer-report
-          path: liveness-primer-report.md
+          path: |
+            liveness-primer-report.md
+            liveness-primer-report.json
           if-no-files-found: error
