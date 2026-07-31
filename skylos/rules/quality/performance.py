@@ -10,6 +10,97 @@ def _get_loop_target_name(node: ast.For) -> str | None:
     return None
 
 
+def _simple_call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _constant_int(node: ast.AST) -> int | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _constant_int(node.operand)
+        if value is not None:
+            return value if isinstance(node.op, ast.UAdd) else -value
+    return None
+
+
+def _unwrap_iterable(node: ast.AST) -> ast.AST:
+    while (
+        isinstance(node, ast.Call)
+        and _simple_call_name(node.func) in {"enumerate", "iter", "reversed"}
+        and node.args
+    ):
+        node = node.args[0]
+    return node
+
+
+def _range_stop(node: ast.AST) -> ast.AST | None:
+    node = _unwrap_iterable(node)
+    if not isinstance(node, ast.Call):
+        return None
+    if _simple_call_name(node.func) not in {"prange", "range"}:
+        return None
+    if len(node.args) == 1:
+        return node.args[0]
+    if 2 <= len(node.args) <= 3:
+        return node.args[1]
+    return None
+
+
+def _is_statically_bounded(node: ast.AST) -> bool:
+    node = _unwrap_iterable(node)
+    if isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, (bytes, str)):
+        return True
+    if isinstance(node, ast.Call) and _simple_call_name(node.func) in {
+        "prange",
+        "range",
+    }:
+        return bool(node.args) and all(
+            _constant_int(arg) is not None for arg in node.args
+        )
+    return False
+
+
+def _cardinality_signature(node: ast.AST) -> tuple[str, str]:
+    node = _unwrap_iterable(node)
+    stop = _range_stop(node)
+    if stop is not None:
+        if (
+            isinstance(stop, ast.Call)
+            and _simple_call_name(stop.func) == "len"
+            and len(stop.args) == 1
+        ):
+            return ("collection", ast.dump(stop.args[0], include_attributes=False))
+        return ("bound", ast.dump(stop, include_attributes=False))
+    return ("collection", ast.dump(node, include_attributes=False))
+
+
+def _is_outer_index_bound(outer: ast.For, inner: ast.For) -> bool:
+    outer_name = _get_loop_target_name(outer)
+    outer_stop = _range_stop(outer.iter)
+    stop = _range_stop(inner.iter)
+    if outer_name is None or outer_stop is None or stop is None:
+        return False
+    if isinstance(stop, ast.Name):
+        return stop.id == outer_name
+    if not isinstance(stop, ast.BinOp):
+        return False
+    if isinstance(stop.left, ast.Name) and stop.left.id == outer_name:
+        return (
+            isinstance(stop.op, (ast.Add, ast.Sub))
+            and _constant_int(stop.right) is not None
+        )
+    if isinstance(stop.right, ast.Name) and stop.right.id == outer_name:
+        return isinstance(stop.op, ast.Add) and _constant_int(stop.left) is not None
+    return False
+
+
 def _inner_iterates_over_outer(outer: ast.For, inner: ast.For) -> bool:
     outer_name = _get_loop_target_name(outer)
     if outer_name is None:
@@ -34,6 +125,16 @@ def _inner_iterates_over_outer(outer: ast.For, inner: ast.For) -> bool:
                     return True
 
     return False
+
+
+def _has_same_input_scale(outer: ast.For, inner: ast.For) -> bool:
+    if _is_statically_bounded(outer.iter) or _is_statically_bounded(inner.iter):
+        return False
+    if _inner_iterates_over_outer(outer, inner):
+        return False
+    if _cardinality_signature(outer.iter) == _cardinality_signature(inner.iter):
+        return True
+    return _is_outer_index_bound(outer, inner)
 
 
 def _is_file_read_context(node: ast.Call) -> bool:
@@ -137,7 +238,7 @@ class PerformanceRule(SkylosRule):
         findings_list = []
         for child in body:
             if isinstance(child, ast.For):
-                if not _inner_iterates_over_outer(outer, child):
+                if _has_same_input_scale(outer, child):
                     findings_list.append(child)
             elif isinstance(child, ast.If):
                 findings_list.extend(self._find_nested_loops(outer, child.body))
@@ -246,7 +347,7 @@ class PerformanceRule(SkylosRule):
                             "simple_name": "for",
                             "value": "O(N^2)",
                             "threshold": 0,
-                            "message": "Performance Warning: Nested loop detected — may be O(N²). Consider using a dict lookup or itertools.",
+                            "message": "Potential Quadratic Work: nested loops appear to scale with the same input. Verify all-pairs work is necessary; for repeated key matching, pre-index the inner collection.",
                             "file": context.get("filename"),
                             "basename": Path(context.get("filename", "")).name,
                             "line": inner_loop.lineno,
