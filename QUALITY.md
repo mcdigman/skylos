@@ -75,7 +75,7 @@ advisory checks first.
 | **Performance** | | |
 | Memory load | SKY-P401 | `.read()` / `.readlines()` loads entire file |
 | Pandas no chunk | SKY-P402 | `read_csv()` without `chunksize` |
-| Nested loop | SKY-P403 | O(N²) complexity |
+| Quadratic lookup | SKY-P403 | Repeated scan a dict or set would remove |
 | Unbounded eager ORM query | SKY-P404 | SQLAlchemy-style `.all()` without limit or pagination |
 | Await in loop | SKY-Q402 | Awaiting serially inside loops where batching may be intended |
 | **Async / Class Design** | | |

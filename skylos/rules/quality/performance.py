@@ -4,36 +4,367 @@ from pathlib import Path
 from skylos.rules.base import SkylosRule
 
 
-def _get_loop_target_name(node: ast.For) -> str | None:
-    if isinstance(node.target, ast.Name):
-        return node.target.id
+_COMPREHENSIONS = (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp)
+_INDEX_ITERATORS = frozenset({"prange", "range"})
+_ITERABLE_WRAPPERS = frozenset(
+    {"enumerate", "iter", "list", "reversed", "sorted", "tuple"}
+)
+# Equality only. ``x in y`` is a substring test as often as a membership test,
+# and no index replaces a substring search, so membership is handled by the
+# narrower linear-scan check where the container is known to be a list.
+_JOIN_OPS = (ast.Eq,)
+_MEMBERSHIP_OPS = (ast.In, ast.NotIn)
+_SCAN_METHODS = frozenset({"count", "index", "remove"})
+_SCOPES = (ast.AsyncFunctionDef, ast.FunctionDef)
+_SEQUENCE_BUILDERS = frozenset({"list", "sorted", "tuple"})
+_SEQUENCE_GROWERS = frozenset({"append", "extend", "insert"})
+_SMALL_ITERABLE_LIMIT = 8
+
+
+def _simple_call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
     return None
 
 
-def _inner_iterates_over_outer(outer: ast.For, inner: ast.For) -> bool:
-    outer_name = _get_loop_target_name(outer)
-    if outer_name is None:
+def _constant_int(node: ast.AST) -> int | None:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, int):
+            return None
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _constant_int(node.operand)
+        if value is None:
+            return None
+        return value if isinstance(node.op, ast.UAdd) else -value
+    return None
+
+
+def _unwrap_iterable(node: ast.AST) -> ast.AST:
+    """Strip wrappers that do not change how many items an iteration visits."""
+    while (
+        isinstance(node, ast.Call)
+        and _simple_call_name(node.func) in _ITERABLE_WRAPPERS
+        and node.args
+    ):
+        node = node.args[0]
+    return node
+
+
+def _is_index_iterator(node: ast.AST | None) -> bool:
+    if node is None:
         return False
+    node = _unwrap_iterable(node)
+    return (
+        isinstance(node, ast.Call) and _simple_call_name(node.func) in _INDEX_ITERATORS
+    )
 
-    inner_iter = inner.iter
 
-    if isinstance(inner_iter, ast.Attribute):
-        if isinstance(inner_iter.value, ast.Name) and inner_iter.value.id == outer_name:
-            return True
+def _constant_range_length(node: ast.Call) -> int | None:
+    bounds = [_constant_int(arg) for arg in node.args]
+    if not bounds or any(bound is None for bound in bounds):
+        return None
+    if len(bounds) == 1:
+        return max(0, bounds[0])
+    step = bounds[2] if len(bounds) == 3 else 1
+    if step == 0:
+        return None
+    return max(0, -(-(bounds[1] - bounds[0]) // step))
 
-    if isinstance(inner_iter, ast.Subscript):
-        if isinstance(inner_iter.value, ast.Name) and inner_iter.value.id == outer_name:
-            return True
 
-    if isinstance(inner_iter, ast.Call):
-        for arg in inner_iter.args:
-            if isinstance(arg, ast.Name) and arg.id == outer_name:
-                return True
-            if isinstance(arg, ast.Attribute):
-                if isinstance(arg.value, ast.Name) and arg.value.id == outer_name:
-                    return True
+def _is_small_iterable(node: ast.AST | None) -> bool:
+    """Does this iterable visibly hold only a handful of items?
 
+    Deliberately narrow: a literal display, a short string, or a fully constant
+    ``range`` that is actually short. ``range(10000)`` is constant but not
+    small, so replacing a parameter with a hard-coded bound never silences a
+    finding.
+    """
+    if node is None:
+        return False
+    node = _unwrap_iterable(node)
+    if isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+        elements = node.keys if isinstance(node, ast.Dict) else node.elts
+        return len(elements) <= _SMALL_ITERABLE_LIMIT
+    if isinstance(node, ast.Constant) and isinstance(node.value, (bytes, str)):
+        return len(node.value) <= _SMALL_ITERABLE_LIMIT
+    if isinstance(node, ast.Call) and _simple_call_name(node.func) in _INDEX_ITERATORS:
+        length = _constant_range_length(node)
+        return length is not None and length <= _SMALL_ITERABLE_LIMIT
     return False
+
+
+def _names_in(node: ast.AST) -> frozenset[str]:
+    return frozenset(
+        child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+    )
+
+
+def _assigned_names(body: list) -> frozenset[str]:
+    """Names rebound by assignment in ``body``.
+
+    Loop targets are deliberately excluded: they belong to the nested loop that
+    binds them, not to the enclosing block.
+    """
+    names: set[str] = set()
+    for statement in body:
+        for node in ast.walk(statement):
+            targets: list = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            for target in targets:
+                names.update(_names_in(target))
+    return frozenset(names)
+
+
+class _Loop:
+    """A loop candidate: what it binds, what it iterates, and what it runs."""
+
+    __slots__ = ("body", "index_like", "iterable", "names", "node")
+
+    def __init__(self, node: ast.AST, names: frozenset[str], iterable, body: list):
+        self.node = node
+        self.names = names
+        self.iterable = iterable
+        self.body = body
+        self.index_like = _is_index_iterator(iterable)
+
+
+def _as_loop(node: ast.AST) -> _Loop | None:
+    if isinstance(node, (ast.AsyncFor, ast.For)):
+        return _Loop(node, _names_in(node.target), node.iter, list(node.body))
+    if isinstance(node, ast.While):
+        # A while loop has no target, so the values it advances are whatever it
+        # rebinds each pass.
+        return _Loop(node, _assigned_names(node.body), None, list(node.body))
+    return None
+
+
+def _comprehension_loops(node: ast.AST) -> list[_Loop]:
+    """Model each comprehension clause as a loop over the clauses after it."""
+    if not isinstance(node, _COMPREHENSIONS):
+        return []
+    loops = []
+    for position, clause in enumerate(node.generators):
+        body: list = list(clause.ifs)
+        for later in node.generators[position + 1 :]:
+            body.append(later.iter)
+            body.extend(later.ifs)
+        if isinstance(node, ast.DictComp):
+            body.extend([node.key, node.value])
+        else:
+            body.append(node.elt)
+        loops.append(_Loop(node, _names_in(clause.target), clause.iter, body))
+    return loops
+
+
+def _is_join_key(operand: ast.AST, names: frozenset[str], index_like: bool) -> bool:
+    """Does ``operand`` read a value produced by a loop over ``names``?
+
+    A bare counter from ``for i in range(n)`` does not qualify. Comparing two
+    counters cannot be replaced by a lookup table, so the operand has to
+    dereference the counter, as in ``rows[i].key``.
+    """
+    if not _names_in(operand) & names:
+        return False
+    return not (index_like and isinstance(operand, ast.Name))
+
+
+def _iterates_over_outer(outer: _Loop, inner: _Loop) -> bool:
+    """Is the inner loop walking a value the outer loop handed it?
+
+    ``for row in rows: for cell in row`` visits each cell once overall, so it is
+    linear in the flattened input rather than quadratic in either loop.
+    """
+    return bool(_names_in(_unwrap_iterable(inner.iterable)) & outer.names)
+
+
+def _blocked_by_fuzzy_match(
+    inner: _Loop, outer_names: frozenset[str]
+) -> frozenset[int]:
+    """Comparisons that share an ``or`` with a match no index can replace.
+
+    ``current.startswith(pkg + ".") or current == pkg`` still has to try every
+    prefix, so indexing the equality alone buys nothing.
+    """
+    blocked: set[int] = set()
+    for statement in inner.body:
+        for node in ast.walk(statement):
+            if not (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)):
+                continue
+            couples_both = any(
+                _names_in(value) & outer_names and _names_in(value) & inner.names
+                for value in node.values
+                if not isinstance(value, ast.Compare)
+            )
+            if couples_both:
+                blocked.update(
+                    id(value) for value in node.values if isinstance(value, ast.Compare)
+                )
+    return frozenset(blocked)
+
+
+def _join_evidence(outer: _Loop, inner: _Loop) -> ast.Compare | None:
+    """Find a comparison that matches an outer value against an inner value.
+
+    That comparison is the reason the nesting exists, and it is exactly what a
+    dict or set built once from the inner collection removes.
+    """
+    if inner.iterable is None:
+        # A while loop has no collection to pre-index.
+        return None
+    if _iterates_over_outer(outer, inner):
+        return None
+    outer_names = outer.names - inner.names
+    blocked = _blocked_by_fuzzy_match(inner, outer_names)
+    for statement in inner.body:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Compare) or id(node) in blocked:
+                continue
+            if not any(isinstance(op, _JOIN_OPS) for op in node.ops):
+                continue
+            outer_side = False
+            inner_side = False
+            for operand in [node.left, *node.comparators]:
+                names = _names_in(operand)
+                if not names & inner.names and _is_join_key(
+                    operand, outer_names, outer.index_like
+                ):
+                    outer_side = True
+                elif not names & outer_names and _is_join_key(
+                    operand, inner.names, inner.index_like
+                ):
+                    inner_side = True
+            if outer_side and inner_side:
+                return node
+    return None
+
+
+def _walk_scope(node: ast.AST):
+    """Yield every node in this scope, stopping at nested function scopes."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        for child in ast.iter_child_nodes(current):
+            if not isinstance(child, _SCOPES):
+                stack.append(child)
+
+
+def _collect_loops(node: ast.AST, enclosing: tuple, found: list) -> None:
+    if isinstance(node, _SCOPES):
+        return
+
+    chain = enclosing
+    for comprehension_loop in _comprehension_loops(node):
+        found.append((comprehension_loop, chain))
+        chain += (comprehension_loop,)
+
+    loop = _as_loop(node)
+    if loop is not None:
+        found.append((loop, enclosing))
+        chain = enclosing + (loop,)
+        # The iterable and the while condition are evaluated outside the loop.
+        outside = node.iter if isinstance(node, (ast.AsyncFor, ast.For)) else node.test
+        _collect_loops(outside, enclosing, found)
+        for child in [*node.body, *node.orelse]:
+            _collect_loops(child, chain, found)
+        return
+
+    for child in ast.iter_child_nodes(node):
+        _collect_loops(child, chain, found)
+
+
+def _scope_loops(scope: ast.AST) -> list[tuple[_Loop, tuple]]:
+    """Every loop in this scope, paired with its enclosing loops outermost first."""
+    found: list = []
+    for child in ast.iter_child_nodes(scope):
+        _collect_loops(child, (), found)
+    return found
+
+
+def _sequence_source(node: ast.AST | None) -> bool:
+    if isinstance(node, (ast.List, ast.ListComp, ast.Tuple)):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and _simple_call_name(node.func) in _SEQUENCE_BUILDERS
+    )
+
+
+def _scannable_sequences(scope: ast.AST) -> frozenset[str]:
+    """Names holding a list whose membership test is a linear scan.
+
+    A name qualifies only when every binding of it is list-like, so a name later
+    rebound to a ``set`` is excluded, and when it is either built at runtime or
+    grown in place. A frozen literal such as ``ORDER = ["low", "high"]`` is a
+    fixed lookup table rather than a collection that scales, so it is left
+    alone.
+    """
+    list_like: dict[str, bool] = {}
+    grown: set[str] = set()
+    built: set[str] = set()
+
+    for node in _walk_scope(scope):
+        targets: list = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                grown.add(node.target.id)
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            sequence_like = _sequence_source(node.value)
+            list_like[target.id] = list_like.get(target.id, True) and sequence_like
+            if sequence_like and not isinstance(node.value, (ast.List, ast.Tuple)):
+                built.add(target.id)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _SEQUENCE_GROWERS
+            and isinstance(node.func.value, ast.Name)
+        ):
+            grown.add(node.func.value.id)
+
+    return frozenset(
+        name
+        for name, sequence_like in list_like.items()
+        if sequence_like and not name.isupper() and (name in grown or name in built)
+    )
+
+
+def _linear_scans(loop: _Loop, sequences: frozenset[str]) -> list[tuple[ast.AST, str]]:
+    """Find lookups inside ``loop`` that rescan a list on every iteration."""
+    found = []
+    for statement in loop.body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Compare) and len(node.comparators) == 1:
+                container = node.comparators[0]
+                if (
+                    any(isinstance(op, _MEMBERSHIP_OPS) for op in node.ops)
+                    and isinstance(container, ast.Name)
+                    and container.id in sequences
+                    and _names_in(node.left) & loop.names
+                ):
+                    found.append((node, container.id))
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _SCAN_METHODS
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in sequences
+                and any(_names_in(arg) & loop.names for arg in node.args)
+            ):
+                found.append((node, node.func.value.id))
+    return found
 
 
 def _is_file_read_context(node: ast.Call) -> bool:
@@ -133,29 +464,70 @@ class PerformanceRule(SkylosRule):
             return True
         return False
 
-    def _find_nested_loops(self, outer: ast.For, body: list[ast.stmt]) -> list[dict]:
-        findings_list = []
-        for child in body:
-            if isinstance(child, ast.For):
-                if not _inner_iterates_over_outer(outer, child):
-                    findings_list.append(child)
-            elif isinstance(child, ast.If):
-                findings_list.extend(self._find_nested_loops(outer, child.body))
-                if child.orelse:
-                    findings_list.extend(self._find_nested_loops(outer, child.orelse))
-            elif isinstance(child, ast.With):
-                findings_list.extend(self._find_nested_loops(outer, child.body))
-            elif isinstance(child, ast.Try):
-                findings_list.extend(self._find_nested_loops(outer, child.body))
-                for handler in child.handlers:
-                    findings_list.extend(self._find_nested_loops(outer, handler.body))
-                if child.orelse:
-                    findings_list.extend(self._find_nested_loops(outer, child.orelse))
-                if child.finalbody:
-                    findings_list.extend(
-                        self._find_nested_loops(outer, child.finalbody)
+    def _quadratic_finding(self, node, context, message: str, value: str) -> dict:
+        return {
+            "rule_id": "SKY-P403",
+            "kind": "performance",
+            "severity": "MEDIUM",
+            "type": "loop",
+            "name": "quadratic_lookup",
+            "simple_name": "for",
+            "value": value,
+            "threshold": 0,
+            "message": message,
+            "file": context.get("filename"),
+            "basename": Path(context.get("filename", "")).name,
+            "line": node.lineno,
+            "col": node.col_offset,
+        }
+
+    def _find_quadratic_lookups(self, scope, context) -> list[dict]:
+        """Report loops whose repeated lookups a pre-built index would remove."""
+        loops = _scope_loops(scope)
+        if not loops:
+            return []
+
+        findings = []
+        sequences = _scannable_sequences(scope)
+
+        for loop, enclosing in loops:
+            for outer in reversed(enclosing):
+                # The nearest enclosing loop that explains the match wins, so a
+                # deep nest reports once rather than once per level.
+                if _is_small_iterable(outer.iterable) or _is_small_iterable(
+                    loop.iterable
+                ):
+                    continue
+                evidence = _join_evidence(outer, loop)
+                if evidence is None:
+                    continue
+                findings.append(
+                    self._quadratic_finding(
+                        loop.node,
+                        context,
+                        "Quadratic Lookup: this nested loop rescans the inner "
+                        f"collection to match '{ast.unparse(evidence)}'. Build a "
+                        "dict or set from the inner collection once before the "
+                        "outer loop, then look the match up directly.",
+                        "join_scan",
                     )
-        return findings_list
+                )
+                break
+
+            for lookup, container in _linear_scans(loop, sequences):
+                findings.append(
+                    self._quadratic_finding(
+                        lookup,
+                        context,
+                        f"Quadratic Lookup: '{ast.unparse(lookup)}' rescans the "
+                        f"list '{container}' on every iteration. Track the same "
+                        f"contents in a set beside '{container}' and test that "
+                        "instead.",
+                        "linear_scan",
+                    )
+                )
+
+        return findings
 
     def visit_node(self, node, context):
         findings = []
@@ -232,26 +604,10 @@ class PerformanceRule(SkylosRule):
                         }
                     )
 
-        if isinstance(node, ast.For):
+        # SKY-P403 runs once per scope so that a loop nest is judged as a whole
+        # and each finding is reported exactly once.
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Module)):
             if "SKY-P403" not in self.ignore_list:
-                suspect_loops = self._find_nested_loops(node, node.body)
-                for inner_loop in suspect_loops:
-                    findings.append(
-                        {
-                            "rule_id": "SKY-P403",
-                            "kind": "performance",
-                            "severity": "LOW",
-                            "type": "loop",
-                            "name": "nested_loop",
-                            "simple_name": "for",
-                            "value": "O(N^2)",
-                            "threshold": 0,
-                            "message": "Performance Warning: Nested loop detected — may be O(N²). Consider using a dict lookup or itertools.",
-                            "file": context.get("filename"),
-                            "basename": Path(context.get("filename", "")).name,
-                            "line": inner_loop.lineno,
-                            "col": inner_loop.col_offset,
-                        }
-                    )
+                findings.extend(self._find_quadratic_lookups(node, context))
 
         return findings if findings else None

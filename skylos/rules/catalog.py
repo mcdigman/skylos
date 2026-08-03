@@ -84,7 +84,7 @@ _RULES = (
     RuleCatalogEntry("SKY-L033", "No-effect statement", "quality"),
     RuleCatalogEntry("SKY-P401", "Inefficient loop pattern", "quality"),
     RuleCatalogEntry("SKY-P402", "Repeated expensive operation", "quality"),
-    RuleCatalogEntry("SKY-P403", "Suspicious performance pattern", "quality"),
+    RuleCatalogEntry("SKY-P403", "Quadratic lookup", "quality", "MEDIUM"),
     RuleCatalogEntry("SKY-P404", "Unbounded eager ORM query", "quality", "MEDIUM"),
     RuleCatalogEntry("SKY-T101", "Missing type annotations", "quality"),
     RuleCatalogEntry("SKY-T102", "Weak framework route typing", "quality"),
