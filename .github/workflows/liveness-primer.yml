@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LIVENESS_PRIMER_REF: human-readable-reporting
+  LIVENESS_PRIMER_REF: static-report-explorer-v2
   PYTHON_VERSION: "3.13"
 
 permissions:
