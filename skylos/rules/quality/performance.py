@@ -13,6 +13,7 @@ ScanOperation: TypeAlias = Literal["count", "index", "membership"]
 _ORIGIN_WRAPPERS = frozenset(
     {"enumerate", "float", "int", "iter", "list", "reversed", "sorted", "str", "tuple"}
 )
+_TRY_NODE_TYPES = (ast.Try, getattr(ast, "TryStar", ast.Try))
 
 
 class _Origin(NamedTuple):
@@ -48,6 +49,32 @@ def _is_local_list(node: ast.expr) -> bool:
     )
 
 
+def _is_list_extension(node: ast.expr) -> bool:
+    return isinstance(node, (ast.List, ast.ListComp)) or (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "list"
+    )
+
+
+def _grown_list_name(node: ast.AST) -> str | None:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.attr in {"append", "extend", "insert"}
+    ):
+        return node.func.value.id
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.op, ast.Add)
+        and isinstance(node.target, ast.Name)
+        and _is_list_extension(node.value)
+    ):
+        return node.target.id
+    return None
+
+
 def _grown_lists(body: list[ast.stmt]) -> set[str]:
     grown: set[str] = set()
     stack: list[ast.AST] = list(body)
@@ -57,15 +84,51 @@ def _grown_lists(body: list[ast.stmt]) -> set[str]:
             node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Lambda)
         ):
             continue
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.attr in {"append", "extend", "insert"}
-        ):
-            grown.add(node.func.value.id)
+        name = _grown_list_name(node)
+        if name is not None:
+            grown.add(name)
         stack.extend(ast.iter_child_nodes(node))
     return grown
+
+
+def _structured_blocks(node: ast.stmt) -> list[list[ast.stmt]]:
+    if isinstance(node, (ast.AsyncWith, ast.With)):
+        return [node.body]
+    if not isinstance(node, _TRY_NODE_TYPES):
+        return []
+    try_node = cast(ast.Try, node)
+    blocks = [
+        try_node.body,
+        *(handler.body for handler in try_node.handlers),
+        try_node.orelse,
+        try_node.finalbody,
+    ]
+    return [block for block in blocks if block]
+
+
+def _wrapped_guard_siblings(
+    node: ast.If, body: list[ast.stmt]
+) -> tuple[list[ast.stmt], list[ast.stmt]] | None:
+    for index, statement in enumerate(body):
+        if statement is node:
+            return body[:index], body[index + 1 :]
+        blocks = _structured_blocks(statement)
+        for block_index, block in enumerate(blocks):
+            nested = _wrapped_guard_siblings(node, block)
+            if nested is None:
+                continue
+            before, after = nested
+            alternate = [
+                sibling
+                for sibling_index, sibling_block in enumerate(blocks)
+                if sibling_index != block_index
+                for sibling in sibling_block
+            ]
+            return (
+                [*body[:index], *alternate, *before],
+                [*after, *body[index + 1 :]],
+            )
+    return None
 
 
 def _list_parameters(node: ast.AsyncFunctionDef | ast.FunctionDef) -> set[str]:
@@ -174,9 +237,11 @@ class _P403Collector(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:
+            self.visit(target)
             self._track_assignment(target, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.target)
         if node.value is None:
             return
         self.visit(node.value)
@@ -246,7 +311,9 @@ class _P403Collector(ast.NodeVisitor):
     def visit_While(self, node: ast.While) -> None:
         binding = self._while_binding(node)
         if binding is None:
+            self.loops.append(_LoopContext(node, False, False, node.body))
             self.generic_visit(node)
+            self.loops.pop()
             return
         assignment, index_name, iterable = binding
         loop_body = [
@@ -362,10 +429,7 @@ class _P403Collector(ast.NodeVisitor):
     ) -> tuple[list[ast.stmt], list[ast.stmt]] | None:
         if loop.body is None:
             return None
-        for index, statement in enumerate(loop.body):
-            if statement is node:
-                return loop.body[:index], loop.body[index + 1 :]
-        return None
+        return _wrapped_guard_siblings(node, loop.body)
 
     def _positive_guard(
         self, node: ast.If, before: list[ast.stmt], after: list[ast.stmt]
@@ -451,7 +515,7 @@ class _P403Collector(ast.NodeVisitor):
         self, name: str, operation: ScanOperation, node: ast.AST
     ) -> None:
         messages = {
-            "membership": f"Membership checks repeatedly scan locally built list '{name}'. Use a set for repeated membership lookups.",
+            "membership": f"Membership checks repeatedly scan locally built list '{name}'. Use a set when duplicates are irrelevant, or maintain counts with collections.Counter.",
             "count": f"'{name}.count(...)' repeatedly scans a locally built list. Maintain counts in a dict or collections.Counter.",
             "index": f"'{name}.index(...)' repeatedly scans a locally built list. Build a value-to-index dict before the loop.",
         }

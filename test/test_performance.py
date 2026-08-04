@@ -117,6 +117,22 @@ for user in users:
             emit(user, order)
         index += 1
 """,
+            "with guard": """
+for user in users:
+    for order in orders:
+        with lock:
+            if user.id == order.user_id:
+                emit(user, order)
+""",
+            "try guard": """
+for user in users:
+    for order in orders:
+        try:
+            if user.id == order.user_id:
+                emit(user, order)
+        except LookupError:
+            pass
+""",
         }
         for label, code in cases.items():
             with self.subTest(label):
@@ -263,6 +279,23 @@ for left in [first, second]:
         if left.id == right.id:
             remember(left, right)
 """,
+            "work beside wrapped guard": """
+for left in lefts:
+    for right in rights:
+        with lock:
+            compare(left, right)
+            if left.id == right.id:
+                remember(left, right)
+""",
+            "work in exception handler": """
+for left in lefts:
+    for right in rights:
+        try:
+            if left.id == right.id:
+                remember(left, right)
+        except LookupError:
+            recover(left, right)
+""",
         }
         for label, code in cases.items():
             with self.subTest(label):
@@ -283,20 +316,60 @@ for item in items:
             ["list_membership", "list_count", "list_index"],
         )
         self.assertIn("set", findings[0]["message"])
+        self.assertIn("duplicates", findings[0]["message"])
         self.assertIn("Counter", findings[1]["message"])
         self.assertIn("value-to-index dict", findings[2]["message"])
 
     def test_detect_list_grown_in_loop(self):
-        code = """
+        cases = {
+            "append": """
 seen = []
 for item in items:
     if item in seen:
         emit(item)
     seen.append(item)
+""",
+            "augmented assignment": """
+seen = []
+for item in items:
+    if item in seen:
+        emit(item)
+    seen += [item]
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                findings = self._analyze(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_detect_list_scan_in_plain_while(self):
+        code = """
+queue = list(start)
+while queue:
+    item = queue.pop()
+    if item in queue:
+        emit(item)
 """
         findings = self._analyze(code)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_detect_list_scan_in_assignment_target(self):
+        cases = {
+            "assignment": "output[values.index(item)] = item",
+            "annotated assignment": "output[values.index(item)]: str = item",
+        }
+        for label, assignment in cases.items():
+            with self.subTest(label):
+                code = f"""
+values = list(source)
+for item in items:
+    {assignment}
+"""
+                findings = self._analyze(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["name"], "list_index")
 
     def test_detect_annotated_list_parameter_scan(self):
         code = """
