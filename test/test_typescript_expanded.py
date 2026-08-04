@@ -100,12 +100,54 @@ class TestTSDangerRules:
         ids = {f["rule_id"] for f in danger}
         assert "SKY-D202" not in ids
 
-    def test_regex_exec_not_flagged(self, tmp_path):
-        """regex.exec() is safe — should NOT trigger SKY-D212."""
-        code = 'const regex = /hello/g;\nconst m = regex.exec("hello world");'
+    def test_regexp_literal_exec_not_flagged(self, tmp_path):
+        """An unescaped RegExp literal should not trigger SKY-D212."""
+        code = (
+            "const GITHUB_PATTERN = /github\\.com/;\n"
+            'const match = GITHUB_PATTERN.exec("https://github.com/org/repo");'
+        )
         _, _, _, danger = _scan_ts(tmp_path, code)
         ids = {f["rule_id"] for f in danger}
         assert "SKY-D212" not in ids
+
+    @pytest.mark.parametrize(
+        ("code", "expected_line"),
+        [
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec = cp.exec;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                4,
+            ),
+            (
+                (
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "function run(GITHUB_PATTERN) {\n"
+                    "  GITHUB_PATTERN.exec(cmd);\n"
+                    "}\n"
+                ),
+                3,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const pattern = cp;\n"
+                    "pattern.exec(cmd);\n"
+                ),
+                3,
+            ),
+        ],
+        ids=["property-replaced", "binding-shadowed", "safe-looking-alias"],
+    )
+    def test_regex_lookalikes_remain_flagged(self, tmp_path, code, expected_line):
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        d212_findings = [f for f in danger if f["rule_id"] == "SKY-D212"]
+        assert len(d212_findings) == 1
+        assert d212_findings[0]["file"] == str(tmp_path / "test.ts")
+        assert d212_findings[0]["line"] == expected_line
 
     def test_db_exec_not_flagged(self, tmp_path):
         """db.exec() / stmt.exec() should NOT trigger SKY-D212."""

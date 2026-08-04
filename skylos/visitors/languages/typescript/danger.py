@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
-from tree_sitter import Language, Query, QueryCursor
+from tree_sitter import Language, Node, Query, QueryCursor
 import tree_sitter_typescript as tsts
 
 from skylos.constants import (
@@ -20,12 +20,7 @@ try:
 except Exception:
     TS_LANG = None
 
-_SAFE_EXEC_OBJECTS: set[str] = {
-    "regex",
-    "re",
-    "regexp",
-    "pattern",
-    "reg",
+_SAFE_DATABASE_EXEC_OBJECTS: set[str] = {
     "db",
     "stmt",
     "query",
@@ -127,6 +122,14 @@ _CHILD_PROCESS_ALIAS_PATTERN = """
   value: (call_expression
     function: (identifier) @require_fn (#eq? @require_fn "require")
     arguments: (arguments (string) @require_module)))
+"""
+
+_REGEXP_LITERAL_BINDING_PATTERN = """
+(lexical_declaration
+  "const"
+  (variable_declarator
+    name: (identifier) @regexp_name
+    value: (regex)))
 """
 
 _INTERNAL_URL_PREFIXES = (
@@ -591,6 +594,62 @@ def _child_process_aliases(root_node, lang: Language, source_bytes: bytes) -> se
     return aliases
 
 
+def _is_regexp_exec_call_receiver(node: Node, source_bytes: bytes) -> bool:
+    member_node = node.parent
+    if member_node is None or member_node.type != "member_expression":
+        return False
+    if member_node.child_by_field_name("object") != node:
+        return False
+
+    property_node = member_node.child_by_field_name("property")
+    if property_node is None or _get_text(source_bytes, property_node) != "exec":
+        return False
+
+    call_node = member_node.parent
+    return (
+        call_node is not None
+        and call_node.type == "call_expression"
+        and call_node.child_by_field_name("function") == member_node
+    )
+
+
+def _proven_regexp_literal_bindings(
+    root_node: Node, lang: Language, source_bytes: bytes
+) -> set[str]:
+    captures = _run_batch(
+        root_node,
+        lang,
+        "danger_regexp_literal_bindings",
+        _REGEXP_LITERAL_BINDING_PATTERN,
+    )
+    declarations: dict[str, list[Node]] = {}
+    for node in captures.get("regexp_name", []):
+        declarations.setdefault(_get_text(source_bytes, node), []).append(node)
+
+    candidates = {name for name, nodes in declarations.items() if len(nodes) == 1}
+    declaration_ranges = {
+        (nodes[0].start_byte, nodes[0].end_byte)
+        for name, nodes in declarations.items()
+        if name in candidates
+    }
+    invalid: set[str] = set()
+    stack = [root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "identifier":
+            name = _get_text(source_bytes, node)
+            location = (node.start_byte, node.end_byte)
+            if (
+                name in candidates
+                and location not in declaration_ranges
+                and not _is_regexp_exec_call_receiver(node, source_bytes)
+            ):
+                invalid.add(name)
+        stack.extend(reversed(node.children))
+
+    return candidates - invalid
+
+
 def _template_prefix(node, source_bytes: bytes) -> str:
     text = _get_text(source_bytes, node)
     if text.startswith("`"):
@@ -785,6 +844,9 @@ def scan_danger(
     jsx_captures = _run_batch(root_node, lang, "danger_jsx", _JSX_PATTERN)
     complex_captures = _run_batch(root_node, lang, "danger_complex", _COMPLEX_PATTERN)
     child_process_aliases = _child_process_aliases(root_node, lang, source_bytes)
+    regexp_literal_bindings = _proven_regexp_literal_bindings(
+        root_node, lang, source_bytes
+    )
     static_string_bindings = _collect_static_string_bindings(root_node, source_bytes)
 
     for k, v in jsx_captures.items():
@@ -822,8 +884,14 @@ def scan_danger(
         obj_node = member_node.child_by_field_name("object")
         if obj_node is None:
             continue
-        obj_name = _get_text(source_bytes, obj_node).lower()
-        if obj_name in _SAFE_EXEC_OBJECTS and obj_name not in child_process_aliases:
+        raw_obj_name = _get_text(source_bytes, obj_node)
+        obj_name = raw_obj_name.lower()
+        if raw_obj_name in regexp_literal_bindings:
+            continue
+        if (
+            obj_name in _SAFE_DATABASE_EXEC_OBJECTS
+            and obj_name not in child_process_aliases
+        ):
             continue
         call_expr = member_node.parent
         command = _first_static_call_arg(call_expr, source_bytes)
