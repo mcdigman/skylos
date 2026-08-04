@@ -103,7 +103,7 @@ const RULES: Record<string, RuleMeta> = {
   "SKY-C304": { name: "Function too long", severity: "MEDIUM", category: "quality", description: "Function exceeds 50 lines.", fix: "Break into smaller functions." },
   "SKY-P401": { name: "Memory risk: file.read()", severity: "LOW", category: "quality", description: "file.read()/readlines() loads entire file into RAM.", fix: "Read in chunks or iterate line by line.", language: "python" },
   "SKY-P402": { name: "Memory risk: read_csv", severity: "LOW", category: "quality", description: "pandas.read_csv() without chunksize loads entire file.", fix: "Use chunksize parameter for large files.", language: "python" },
-  "SKY-P403": { name: "Nested loop (O(N^2))", severity: "LOW", category: "quality", description: "Nested loop detected; potential O(N^2) performance issue.", fix: "Consider using sets, dicts, or itertools for better performance." },
+  "SKY-P403": { name: "Repeated linear lookup", severity: "LOW", category: "quality", description: "A loop repeatedly scans a collection for matching items.", fix: "Build a dict, set, Counter, or position map once before the loop." },
   "SKY-P404": { name: "Unbounded eager ORM query", severity: "MEDIUM", category: "quality", description: "SQLAlchemy-style ORM .all() call may load an entire table.", fix: "Add limit, pagination, or streaming.", language: "python" },
 
   "SKY-Q305": { name: "Duplicate branch", severity: "MEDIUM", category: "quality", description: "Duplicate branch condition or body.", fix: "Remove or correct the duplicate branch logic." },
