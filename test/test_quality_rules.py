@@ -496,11 +496,13 @@ df = pd.read_csv('data.csv', chunksize=1000)
         assert not any(f["rule_id"] == "SKY-P402" for f in findings)
 
     def test_nested_loop(self):
+        # The match has to select real work; `pass` gives an index nothing to
+        # remove, so the body does something a lookup table would replace.
         code = """
 for item in data:
     for other in data:
         if item == other:
-            pass
+            record(item)
 """
         rule = PerformanceRule(ignore_list=[])
         findings = check_code(rule, code)

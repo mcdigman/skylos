@@ -1,6 +1,64 @@
 import unittest
+from pathlib import Path
 import ast
 from skylos.rules.quality.performance import PerformanceRule
+
+
+class TestPerformanceRuleDispatch(unittest.TestCase):
+    """The linter only hands a rule the node types it is registered for.
+
+    A rule that reads a node type missing from that table is silently dead in
+    the real pipeline while still passing tests that walk every node.
+    """
+
+    @staticmethod
+    def _registered_node_types() -> set[str]:
+        """Read the routing table from source.
+
+        Importing ``file_processing`` pulls in every language backend, so the
+        table is parsed instead. That keeps this guard runnable wherever the
+        rule itself is runnable.
+        """
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "skylos"
+            / "analysis"
+            / "file_processing.py"
+        )
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                if not (isinstance(key, ast.Name) and key.id == "PerformanceRule"):
+                    continue
+                return {
+                    element.attr
+                    for element in ast.walk(value)
+                    if isinstance(element, ast.Attribute)
+                }
+        raise AssertionError("PerformanceRule is missing from LINTER_RULE_NODE_TYPES")
+
+    def test_registered_node_types_cover_what_visit_node_reads(self):
+        registered = self._registered_node_types()
+        source = ast.parse(
+            """
+def match(users, orders):
+    for user in users:
+        for order in orders:
+            if user.id == order.user_id:
+                consume(user, order)
+"""
+        )
+        rule = PerformanceRule(ignore_list=[])
+        emitting = {
+            type(node).__name__
+            for node in ast.walk(source)
+            if rule.visit_node(node, {"filename": "t.py"})
+        }
+        self.assertTrue(
+            emitting, "fixture produced no findings, so the test proves nothing"
+        )
+        self.assertLessEqual(emitting, registered, f"unrouted: {emitting - registered}")
 
 
 class TestPerformanceRule(unittest.TestCase):
@@ -63,7 +121,7 @@ def match(users, orders):
 """
         findings = self._p403(code)
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]["severity"], "MEDIUM")
+        self.assertEqual(findings[0]["severity"], "LOW")
         self.assertEqual(findings[0]["value"], "join_scan")
         self.assertEqual(findings[0]["line"], 4)
         self.assertIn("user.id == order.user_id", findings[0]["message"])
@@ -126,7 +184,7 @@ def unique(values):
 """
         findings = self._p403(code)
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]["value"], "linear_scan")
+        self.assertEqual(findings[0]["value"], "linear_scan_membership")
         self.assertIn("seen", findings[0]["message"])
 
     def test_detect_linear_scan_via_list_methods(self):
@@ -137,6 +195,170 @@ def positions(values, raw):
         consume(ordered.index(value))
 """
         self.assertEqual(len(self._p403(code)), 1)
+
+    def test_scan_apis_report_their_own_remedy(self):
+        cases = {
+            "index": ("consume(ordered.index(value))", "first index"),
+            "count": ("consume(ordered.count(value))", "collections.Counter"),
+        }
+        for method, (call, remedy) in cases.items():
+            code = f"""
+def scan(values, raw):
+    ordered = list(raw)
+    for value in values:
+        {call}
+"""
+            with self.subTest(method=method):
+                findings = self._p403(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["value"], f"linear_scan_{method}")
+                self.assertIn(remedy, findings[0]["message"])
+
+    def test_allow_list_remove_in_loop(self):
+        # Order, duplicate and ValueError semantics mean no set-shaped rewrite
+        # preserves behaviour, so this is not a quadratic-lookup finding.
+        code = """
+def drain(values, raw):
+    ordered = list(raw)
+    for value in values:
+        ordered.remove(value)
+"""
+        self.assertEqual(self._p403(code), [])
+
+    def test_allow_equality_that_does_not_select_the_work(self):
+        code = """
+def skip_one(users, orders):
+    for user in users:
+        for order in orders:
+            if user.id == order.user_id:
+                continue
+            score(user, order)
+
+def tally_only(users, orders):
+    hits = 0
+    for user in users:
+        for order in orders:
+            score(user, order)
+            if user.id == order.user_id:
+                hits += 1
+    return hits
+
+def ored_with_a_range_test(users, orders):
+    for user in users:
+        for order in orders:
+            if user.start < order.end or user.id == order.user_id:
+                consume(user, order)
+
+def chained_against_a_constant(users, orders, threshold):
+    for user in users:
+        for order in orders:
+            if user.rank < threshold == order.rank:
+                consume(user, order)
+"""
+        self.assertEqual(self._p403(code), [])
+
+    def test_equality_and_its_inverted_spelling_agree(self):
+        bodies = {
+            "positive": "if user.id == order.user_id:\n                consume(user, order)",
+            "inverted": "if user.id != order.user_id:\n                continue\n            consume(user, order)",
+            "inverted_not": "if not user.id == order.user_id:\n                continue\n            consume(user, order)",
+        }
+        for label, body in bodies.items():
+            code = f"""
+def match(users, orders):
+    for user in users:
+        for order in orders:
+            {body}
+"""
+            with self.subTest(form=label):
+                findings = self._p403(code)
+                self.assertEqual(len(findings), 1, findings)
+                self.assertEqual(findings[0]["value"], "join_scan")
+
+    def test_allow_inverted_skip_with_work_on_every_pair(self):
+        code = """
+def match(users, orders):
+    for user in users:
+        for order in orders:
+            score(user, order)
+            if user.id != order.user_id:
+                continue
+            consume(user, order)
+"""
+        self.assertEqual(self._p403(code), [])
+
+    def test_detect_join_narrowed_by_an_and(self):
+        # `and` still leaves an indexed bucket to filter, so it stays a finding.
+        code = """
+def match(users, orders):
+    for user in users:
+        for order in orders:
+            if user.id == order.user_id and order.active:
+                consume(user, order)
+"""
+        self.assertEqual(len(self._p403(code)), 1)
+
+    def test_detect_join_guarded_inside_with_and_try(self):
+        code = """
+def match(users, orders, lock):
+    for user in users:
+        for order in orders:
+            with lock:
+                try:
+                    if user.id == order.user_id:
+                        consume(user, order)
+                finally:
+                    release()
+"""
+        self.assertEqual(len(self._p403(code)), 1)
+
+    def test_allow_inequality_that_is_not_a_bare_compare(self):
+        # A compound skip changes which pairs survive, so it is left alone.
+        code = """
+def match(users, orders):
+    for user in users:
+        for order in orders:
+            if user.id != order.user_id and order.active:
+                continue
+            consume(user, order)
+"""
+        self.assertEqual(self._p403(code), [])
+
+    def test_detect_comprehension_whose_element_is_the_match(self):
+        code = """
+def matched(users, orders):
+    return any(u.id == o.user_id for u in users for o in orders)
+"""
+        self.assertEqual(len(self._p403(code)), 1)
+
+    def test_allow_comprehension_element_that_merely_contains_a_match(self):
+        code = """
+def scored(users, orders):
+    return [score(u, o, u.id == o.user_id) for u in users for o in orders]
+"""
+        self.assertEqual(self._p403(code), [])
+
+    def test_allow_work_deferred_to_another_scope(self):
+        code = """
+def build_handlers(values, raw):
+    ordered = list(raw)
+    handlers = []
+    for value in values:
+
+        def later():
+            if value in ordered:
+                consume(value)
+
+        handlers.append(later)
+    return handlers
+
+def build_lambdas(users, orders):
+    out = []
+    for user in users:
+        out.append(lambda: any(user.id == o.user_id for o in orders))
+    return out
+"""
+        self.assertEqual(self._p403(code), [])
 
     def test_allow_all_pairs_work_without_a_lookup(self):
         code = """
@@ -410,7 +632,7 @@ def ignore_me(f, users, orders):
     for user in users:
         for order in orders:
             if user.id == order.user_id:
-                pass
+                consume(user, order)
 """
         findings = self._analyze(code, ignore_list=[])
         self.assertEqual(len(findings), 2)

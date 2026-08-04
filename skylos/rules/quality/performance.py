@@ -14,8 +14,28 @@ _ITERABLE_WRAPPERS = frozenset(
 # narrower linear-scan check where the container is known to be a list.
 _JOIN_OPS = (ast.Eq,)
 _MEMBERSHIP_OPS = (ast.In, ast.NotIn)
-_SCAN_METHODS = frozenset({"count", "index", "remove"})
-_SCOPES = (ast.AsyncFunctionDef, ast.FunctionDef)
+# `remove` is deliberately absent: a repeated `list.remove` in a loop is a
+# question about mutation during iteration, and no set-shaped rewrite preserves
+# its order, duplicate and ValueError semantics.
+_SCAN_METHODS = frozenset({"count", "index"})
+_SCAN_REMEDIES = {
+    "count": (
+        "counts occurrences in the list '{name}' on every iteration. Build a "
+        "collections.Counter over '{name}' once, then read the count directly."
+    ),
+    "index": (
+        "scans the list '{name}' for a position on every iteration. Build a "
+        "dict of value to first index over '{name}' once, then look the "
+        "position up directly."
+    ),
+    "membership": (
+        "rescans the list '{name}' on every iteration. Track the same contents "
+        "in a set beside '{name}' and test that instead."
+    ),
+}
+# Bodies that run when they are called, not where they are written. A loop that
+# only defines one of these does not run its contents per iteration.
+_SCOPES = (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)
 _SEQUENCE_BUILDERS = frozenset({"list", "sorted", "tuple"})
 _SEQUENCE_GROWERS = frozenset({"append", "extend", "insert"})
 _SMALL_ITERABLE_LIMIT = 8
@@ -124,14 +144,31 @@ def _assigned_names(body: list) -> frozenset[str]:
 class _Loop:
     """A loop candidate: what it binds, what it iterates, and what it runs."""
 
-    __slots__ = ("body", "index_like", "iterable", "names", "node")
+    __slots__ = ("body", "ifs", "index_like", "iterable", "names", "node", "results")
 
-    def __init__(self, node: ast.AST, names: frozenset[str], iterable, body: list):
+    def __init__(
+        self,
+        node: ast.AST,
+        names: frozenset[str],
+        iterable,
+        body: list,
+        ifs: list | None = None,
+        results: list | None = None,
+    ):
         self.node = node
         self.names = names
         self.iterable = iterable
         self.body = body
+        # Filters and element expressions of a comprehension clause. Both are
+        # empty for statement loops, whose guards are `if` statements found by
+        # walking the body instead.
+        self.ifs = ifs or []
+        self.results = results or []
         self.index_like = _is_index_iterator(iterable)
+
+    @property
+    def is_comprehension(self) -> bool:
+        return bool(self.ifs or self.results)
 
 
 def _as_loop(node: ast.AST) -> _Loop | None:
@@ -148,17 +185,24 @@ def _comprehension_loops(node: ast.AST) -> list[_Loop]:
     """Model each comprehension clause as a loop over the clauses after it."""
     if not isinstance(node, _COMPREHENSIONS):
         return []
+    results = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
     loops = []
     for position, clause in enumerate(node.generators):
         body: list = list(clause.ifs)
         for later in node.generators[position + 1 :]:
             body.append(later.iter)
             body.extend(later.ifs)
-        if isinstance(node, ast.DictComp):
-            body.extend([node.key, node.value])
-        else:
-            body.append(node.elt)
-        loops.append(_Loop(node, _names_in(clause.target), clause.iter, body))
+        body.extend(results)
+        loops.append(
+            _Loop(
+                node,
+                _names_in(clause.target),
+                clause.iter,
+                body,
+                list(clause.ifs),
+                results,
+            )
+        )
     return loops
 
 
@@ -183,36 +227,152 @@ def _iterates_over_outer(outer: _Loop, inner: _Loop) -> bool:
     return bool(_names_in(_unwrap_iterable(inner.iterable)) & outer.names)
 
 
-def _blocked_by_fuzzy_match(
-    inner: _Loop, outer_names: frozenset[str]
-) -> frozenset[int]:
-    """Comparisons that share an ``or`` with a match no index can replace.
+def _is_side(
+    operand: ast.AST, own: frozenset[str], other: frozenset[str], index_like: bool
+) -> bool:
+    return not (_names_in(operand) & other) and _is_join_key(operand, own, index_like)
 
-    ``current.startswith(pkg + ".") or current == pkg`` still has to try every
-    prefix, so indexing the equality alone buys nothing.
+
+def _compare_pair(
+    node: ast.Compare, op_type, outer: _Loop, inner: _Loop, outer_names: frozenset[str]
+) -> ast.Compare | None:
+    """Does ``node`` compare an outer value directly against an inner value?
+
+    Chained comparisons are checked pair by pair, so ``a.rank < limit ==
+    b.rank`` does not count: the ``==`` there relates ``limit`` to the inner
+    value, and no index over the inner collection removes the ``<``.
     """
-    blocked: set[int] = set()
-    for statement in inner.body:
-        for node in ast.walk(statement):
-            if not (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)):
-                continue
-            couples_both = any(
-                _names_in(value) & outer_names and _names_in(value) & inner.names
-                for value in node.values
-                if not isinstance(value, ast.Compare)
+    operands = [node.left, *node.comparators]
+    for position, op in enumerate(node.ops):
+        if not isinstance(op, op_type):
+            continue
+        left, right = operands[position], operands[position + 1]
+        for first, second in ((left, right), (right, left)):
+            if _is_side(first, outer_names, inner.names, outer.index_like) and _is_side(
+                second, inner.names, outer_names, inner.index_like
+            ):
+                return node
+    return None
+
+
+def _selecting_equality(
+    test: ast.AST, outer: _Loop, inner: _Loop, outer_names: frozenset[str]
+) -> ast.Compare | None:
+    """An equality that decides, on its own, which pairs get the work.
+
+    ``and`` is fine - the surviving terms still filter an indexed bucket. ``or``
+    is not: ``module.startswith(package + ".") or module == package`` still has
+    to try every package, so indexing the equality buys nothing.
+    """
+    if isinstance(test, ast.BoolOp):
+        if isinstance(test.op, ast.Or):
+            return None
+        for value in test.values:
+            found = _selecting_equality(value, outer, inner, outer_names)
+            if found is not None:
+                return found
+        return None
+    if isinstance(test, ast.Compare):
+        return _compare_pair(test, ast.Eq, outer, inner, outer_names)
+    return None
+
+
+def _selecting_inequality(
+    test: ast.AST, outer: _Loop, inner: _Loop, outer_names: frozenset[str]
+) -> ast.Compare | None:
+    """The inverted spelling: skip the non-matches, then do the work.
+
+    Only a bare ``!=`` or ``not (... == ...)`` counts. Anything compound would
+    change which pairs survive the skip, so it is left alone.
+    """
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        if isinstance(test.operand, ast.Compare):
+            return _compare_pair(test.operand, ast.Eq, outer, inner, outer_names)
+        return None
+    if isinstance(test, ast.Compare):
+        return _compare_pair(test, ast.NotEq, outer, inner, outer_names)
+    return None
+
+
+def _is_substantive(body: list) -> bool:
+    """Does this branch do anything beyond falling through to the next pair?"""
+    return any(
+        not isinstance(statement, (ast.Continue, ast.Pass)) for statement in body
+    )
+
+
+def _is_skip(body: list) -> bool:
+    return len(body) == 1 and isinstance(body[0], ast.Continue)
+
+
+def _does_pair_work(statements: list, inner: _Loop) -> bool:
+    """Is there work here that runs whether or not the pair matched?
+
+    Assignments are excluded: deriving a value from the inner element is setup
+    for the match, not the work the match is supposed to be guarding.
+    """
+    return any(
+        _names_in(statement) & inner.names
+        and not isinstance(statement, (ast.AnnAssign, ast.Assign))
+        for statement in statements
+    )
+
+
+def _guarded_statement_lists(statement: ast.stmt):
+    """Statement lists that run under the same pair as their parent."""
+    if isinstance(statement, ast.If):
+        yield statement.body
+        yield statement.orelse
+    elif isinstance(statement, (ast.AsyncWith, ast.With)):
+        yield statement.body
+    elif isinstance(statement, ast.Try):
+        yield statement.body
+        yield statement.orelse
+        yield statement.finalbody
+        for handler in statement.handlers:
+            yield handler.body
+
+
+def _scan_statements(
+    statements: list, outer: _Loop, inner: _Loop, outer_names: frozenset[str]
+) -> ast.Compare | None:
+    for position, statement in enumerate(statements):
+        if isinstance(statement, ast.If) and not statement.orelse:
+            siblings = statements[:position] + statements[position + 1 :]
+            equality = _selecting_equality(statement.test, outer, inner, outer_names)
+            if (
+                equality is not None
+                and _is_substantive(statement.body)
+                and not _does_pair_work(siblings, inner)
+            ):
+                return equality
+
+            inequality = _selecting_inequality(
+                statement.test, outer, inner, outer_names
             )
-            if couples_both:
-                blocked.update(
-                    id(value) for value in node.values if isinstance(value, ast.Compare)
-                )
-    return frozenset(blocked)
+            if (
+                inequality is not None
+                and _is_skip(statement.body)
+                and _does_pair_work(statements[position + 1 :], inner)
+                and not _does_pair_work(statements[:position], inner)
+            ):
+                return inequality
+
+        for nested in _guarded_statement_lists(statement):
+            found = _scan_statements(nested, outer, inner, outer_names)
+            if found is not None:
+                return found
+    return None
 
 
 def _join_evidence(outer: _Loop, inner: _Loop) -> ast.Compare | None:
-    """Find a comparison that matches an outer value against an inner value.
+    """Find the equality that explains why the nesting exists.
 
-    That comparison is the reason the nesting exists, and it is exactly what a
-    dict or set built once from the inner collection removes.
+    It is not enough for a qualifying ``==`` to appear somewhere in the inner
+    body. The match has to decide which pairs get the work, because that is the
+    thing a dict or set built once from the inner collection replaces. An
+    equality that merely skips one pair, or that tallies a count while every
+    pair is processed anyway, leaves the pairwise work exactly where it was.
     """
     if inner.iterable is None:
         # A while loop has no collection to pre-index.
@@ -220,28 +380,24 @@ def _join_evidence(outer: _Loop, inner: _Loop) -> ast.Compare | None:
     if _iterates_over_outer(outer, inner):
         return None
     outer_names = outer.names - inner.names
-    blocked = _blocked_by_fuzzy_match(inner, outer_names)
-    for statement in inner.body:
-        for node in ast.walk(statement):
-            if not isinstance(node, ast.Compare) or id(node) in blocked:
-                continue
-            if not any(isinstance(op, _JOIN_OPS) for op in node.ops):
-                continue
-            outer_side = False
-            inner_side = False
-            for operand in [node.left, *node.comparators]:
-                names = _names_in(operand)
-                if not names & inner.names and _is_join_key(
-                    operand, outer_names, outer.index_like
-                ):
-                    outer_side = True
-                elif not names & outer_names and _is_join_key(
-                    operand, inner.names, inner.index_like
-                ):
-                    inner_side = True
-            if outer_side and inner_side:
-                return node
-    return None
+    if inner.is_comprehension:
+        # A comprehension clause selects per pair rather than branching, so its
+        # filters are the guard. The element counts too when it *is* the
+        # comparison, as in `any(a.key == b.key for a in xs for b in ys)`;
+        # an element that merely contains one somewhere does not.
+        for test in [*inner.ifs, *inner.results]:
+            found = _selecting_equality(test, outer, inner, outer_names)
+            if found is not None:
+                return found
+        return None
+    return _scan_statements(inner.body, outer, inner, outer_names)
+
+
+def _walk_body(statements: list):
+    """Yield nodes reachable from these statements without entering a new scope."""
+    for statement in statements:
+        if not isinstance(statement, _SCOPES):
+            yield from _walk_scope(statement)
 
 
 def _walk_scope(node: ast.AST):
@@ -341,29 +497,36 @@ def _scannable_sequences(scope: ast.AST) -> frozenset[str]:
     )
 
 
-def _linear_scans(loop: _Loop, sequences: frozenset[str]) -> list[tuple[ast.AST, str]]:
-    """Find lookups inside ``loop`` that rescan a list on every iteration."""
+def _linear_scans(
+    loop: _Loop, sequences: frozenset[str]
+) -> list[tuple[ast.AST, str, str]]:
+    """Find lookups inside ``loop`` that rescan a list on every iteration.
+
+    Each kind is reported separately because each needs a different replacement:
+    a set answers membership, a ``Counter`` answers ``count``, and a position
+    map answers ``index``. Suggesting one remedy for all three would propose a
+    rewrite that does not preserve behaviour.
+    """
     found = []
-    for statement in loop.body:
-        for node in ast.walk(statement):
-            if isinstance(node, ast.Compare) and len(node.comparators) == 1:
-                container = node.comparators[0]
-                if (
-                    any(isinstance(op, _MEMBERSHIP_OPS) for op in node.ops)
-                    and isinstance(container, ast.Name)
-                    and container.id in sequences
-                    and _names_in(node.left) & loop.names
-                ):
-                    found.append((node, container.id))
-            elif (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in _SCAN_METHODS
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in sequences
-                and any(_names_in(arg) & loop.names for arg in node.args)
+    for node in _walk_body(loop.body):
+        if isinstance(node, ast.Compare) and len(node.comparators) == 1:
+            container = node.comparators[0]
+            if (
+                any(isinstance(op, _MEMBERSHIP_OPS) for op in node.ops)
+                and isinstance(container, ast.Name)
+                and container.id in sequences
+                and _names_in(node.left) & loop.names
             ):
-                found.append((node, node.func.value.id))
+                found.append((node, container.id, "membership"))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _SCAN_METHODS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in sequences
+            and any(_names_in(arg) & loop.names for arg in node.args)
+        ):
+            found.append((node, node.func.value.id, node.func.attr))
     return found
 
 
@@ -468,7 +631,7 @@ class PerformanceRule(SkylosRule):
         return {
             "rule_id": "SKY-P403",
             "kind": "performance",
-            "severity": "MEDIUM",
+            "severity": "LOW",
             "type": "loop",
             "name": "quadratic_lookup",
             "simple_name": "for",
@@ -514,16 +677,14 @@ class PerformanceRule(SkylosRule):
                 )
                 break
 
-            for lookup, container in _linear_scans(loop, sequences):
+            for lookup, container, kind in _linear_scans(loop, sequences):
+                remedy = _SCAN_REMEDIES[kind].format(name=container)
                 findings.append(
                     self._quadratic_finding(
                         lookup,
                         context,
-                        f"Quadratic Lookup: '{ast.unparse(lookup)}' rescans the "
-                        f"list '{container}' on every iteration. Track the same "
-                        f"contents in a set beside '{container}' and test that "
-                        "instead.",
-                        "linear_scan",
+                        f"Quadratic Lookup: '{ast.unparse(lookup)}' {remedy}",
+                        f"linear_scan_{kind}",
                     )
                 )
 
@@ -606,7 +767,7 @@ class PerformanceRule(SkylosRule):
 
         # SKY-P403 runs once per scope so that a loop nest is judged as a whole
         # and each finding is reported exactly once.
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Module)):
+        if isinstance(node, (*_SCOPES, ast.Module)):
             if "SKY-P403" not in self.ignore_list:
                 findings.extend(self._find_quadratic_lookups(node, context))
 

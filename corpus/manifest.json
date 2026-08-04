@@ -12,7 +12,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["index"]
+          "unused_functions": [
+            "index"
+          ]
         },
         "present": {}
       }
@@ -28,7 +30,10 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["get_db", "read_root"]
+          "unused_functions": [
+            "get_db",
+            "read_root"
+          ]
         },
         "present": {}
       }
@@ -44,7 +49,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["add"]
+          "unused_functions": [
+            "add"
+          ]
         },
         "present": {}
       }
@@ -60,7 +67,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["my_hook"]
+          "unused_functions": [
+            "my_hook"
+          ]
         },
         "present": {}
       }
@@ -81,7 +90,12 @@
             "pytest_cmdline_main",
             "pytest_assertrepr_compare"
           ],
-          "unused_parameters": ["config", "op", "left", "right"]
+          "unused_parameters": [
+            "config",
+            "op",
+            "left",
+            "right"
+          ]
         },
         "present": {}
       }
@@ -97,7 +111,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["main"]
+          "unused_functions": [
+            "main"
+          ]
         },
         "present": {}
       }
@@ -113,7 +129,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["homepage"]
+          "unused_functions": [
+            "homepage"
+          ]
         },
         "present": {}
       }
@@ -129,7 +147,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["before_start"]
+          "unused_functions": [
+            "before_start"
+          ]
         },
         "present": {}
       }
@@ -145,7 +165,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["home"]
+          "unused_functions": [
+            "home"
+          ]
         },
         "present": {}
       }
@@ -182,8 +204,13 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["to_python", "to_url"],
-          "unused_variables": ["regex"]
+          "unused_functions": [
+            "to_python",
+            "to_url"
+          ],
+          "unused_variables": [
+            "regex"
+          ]
         },
         "present": {}
       }
@@ -199,7 +226,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["worker_exit"],
+          "unused_functions": [
+            "worker_exit"
+          ],
           "unused_variables": [
             "bind",
             "forwarded_allow_ips",
@@ -228,8 +257,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["get"],
-          "unused_classes": ["HomeView"]
+          "unused_functions": [
+            "get"
+          ],
+          "unused_classes": [
+            "HomeView"
+          ]
         },
         "present": {}
       }
@@ -245,8 +278,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["list"],
-          "unused_classes": ["UserViewSet"]
+          "unused_functions": [
+            "list"
+          ],
+          "unused_classes": [
+            "UserViewSet"
+          ]
         },
         "present": {}
       }
@@ -262,9 +299,15 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["validate_email"],
-          "unused_classes": ["UserSerializer"],
-          "unused_variables": ["email"]
+          "unused_functions": [
+            "validate_email"
+          ],
+          "unused_classes": [
+            "UserSerializer"
+          ],
+          "unused_variables": [
+            "email"
+          ]
         },
         "present": {}
       }
@@ -280,8 +323,13 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["User"],
-          "unused_variables": ["id", "name"]
+          "unused_classes": [
+            "User"
+          ],
+          "unused_variables": [
+            "id",
+            "name"
+          ]
         },
         "present": {}
       }
@@ -297,8 +345,13 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["create_user", "validate_email"],
-          "unused_classes": ["UserIn"]
+          "unused_functions": [
+            "create_user",
+            "validate_email"
+          ],
+          "unused_classes": [
+            "UserIn"
+          ]
         },
         "present": {}
       }
@@ -314,7 +367,9 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["Settings"]
+          "unused_classes": [
+            "Settings"
+          ]
         },
         "present": {}
       }
@@ -330,8 +385,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["hello"],
-          "unused_parameters": ["request"]
+          "unused_functions": [
+            "hello"
+          ],
+          "unused_parameters": [
+            "request"
+          ]
         },
         "present": {}
       }
@@ -347,7 +406,10 @@
       },
       "expect": {
         "absent": {
-          "unused_variables": ["id", "name"]
+          "unused_variables": [
+            "id",
+            "name"
+          ]
         },
         "present": {}
       }
@@ -367,7 +429,10 @@
       "expect": {
         "absent": {},
         "present": {
-          "quality": ["SKY-UC001", "while_false"]
+          "quality": [
+            "SKY-UC001",
+            "while_false"
+          ]
         }
       }
     },
@@ -382,8 +447,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["make_user"],
-          "unused_classes": ["UserSchema"]
+          "unused_functions": [
+            "make_user"
+          ],
+          "unused_classes": [
+            "UserSchema"
+          ]
         },
         "present": {}
       }
@@ -399,8 +468,13 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["on_connect"],
-          "unused_parameters": ["dbapi_connection", "connection_record"]
+          "unused_functions": [
+            "on_connect"
+          ],
+          "unused_parameters": [
+            "dbapi_connection",
+            "connection_record"
+          ]
         },
         "present": {}
       }
@@ -416,7 +490,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["list_users"]
+          "unused_functions": [
+            "list_users"
+          ]
         },
         "present": {}
       }
@@ -432,7 +508,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["read_items"]
+          "unused_functions": [
+            "read_items"
+          ]
         },
         "present": {}
       }
@@ -448,7 +526,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["ping"]
+          "unused_functions": [
+            "ping"
+          ]
         },
         "present": {}
       }
@@ -464,8 +544,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["handle"],
-          "unused_classes": ["Command"]
+          "unused_functions": [
+            "handle"
+          ],
+          "unused_classes": [
+            "Command"
+          ]
         },
         "present": {}
       }
@@ -481,7 +565,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["on_save"]
+          "unused_functions": [
+            "on_save"
+          ]
         },
         "present": {}
       }
@@ -497,8 +583,13 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["on_connect"],
-          "unused_parameters": ["dbapi_connection", "connection_record"]
+          "unused_functions": [
+            "on_connect"
+          ],
+          "unused_parameters": [
+            "dbapi_connection",
+            "connection_record"
+          ]
         },
         "present": {}
       }
@@ -514,8 +605,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["validate_schema"],
-          "unused_classes": ["UserSchema"]
+          "unused_functions": [
+            "validate_schema"
+          ],
+          "unused_classes": [
+            "UserSchema"
+          ]
         },
         "present": {}
       }
@@ -531,7 +626,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["timeout"]
+          "unused_functions": [
+            "timeout"
+          ]
         },
         "present": {}
       }
@@ -547,7 +644,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["name"]
+          "unused_functions": [
+            "name"
+          ]
         },
         "present": {}
       }
@@ -563,7 +662,9 @@
       },
       "expect": {
         "absent": {
-          "unused_imports": ["User"]
+          "unused_imports": [
+            "User"
+          ]
         },
         "present": {}
       }
@@ -579,8 +680,12 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["public_function"],
-          "unused_classes": ["PublicClass"]
+          "unused_functions": [
+            "public_function"
+          ],
+          "unused_classes": [
+            "PublicClass"
+          ]
         },
         "present": {}
       }
@@ -596,7 +701,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["main"]
+          "unused_functions": [
+            "main"
+          ]
         },
         "present": {}
       }
@@ -612,7 +719,9 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["UserAdmin"]
+          "unused_classes": [
+            "UserAdmin"
+          ]
         },
         "present": {}
       }
@@ -628,8 +737,12 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["DemoConfig"],
-          "unused_functions": ["ready"]
+          "unused_classes": [
+            "DemoConfig"
+          ],
+          "unused_functions": [
+            "ready"
+          ]
         },
         "present": {}
       }
@@ -645,8 +758,12 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["DemoTask"],
-          "unused_functions": ["run"]
+          "unused_classes": [
+            "DemoTask"
+          ],
+          "unused_functions": [
+            "run"
+          ]
         },
         "present": {}
       }
@@ -662,8 +779,12 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["DemoCommand"],
-          "unused_functions": ["invoke"]
+          "unused_classes": [
+            "DemoCommand"
+          ],
+          "unused_functions": [
+            "invoke"
+          ]
         },
         "present": {}
       }
@@ -679,8 +800,12 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["User"],
-          "unused_functions": ["full_name"]
+          "unused_classes": [
+            "User"
+          ],
+          "unused_functions": [
+            "full_name"
+          ]
         },
         "present": {}
       }
@@ -696,8 +821,13 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["User"],
-          "unused_functions": ["serialize_name", "serialize_model"]
+          "unused_classes": [
+            "User"
+          ],
+          "unused_functions": [
+            "serialize_name",
+            "serialize_model"
+          ]
         },
         "present": {}
       }
@@ -713,8 +843,12 @@
       },
       "expect": {
         "absent": {
-          "unused_classes": ["User"],
-          "unused_functions": ["model_post_init"]
+          "unused_classes": [
+            "User"
+          ],
+          "unused_functions": [
+            "model_post_init"
+          ]
         },
         "present": {}
       }
@@ -730,7 +864,10 @@
       },
       "expect": {
         "absent": {
-          "unused_variables": ["RED", "BLUE"]
+          "unused_variables": [
+            "RED",
+            "BLUE"
+          ]
         },
         "present": {}
       }
@@ -746,7 +883,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["run"]
+          "unused_functions": [
+            "run"
+          ]
         },
         "present": {}
       }
@@ -762,7 +901,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["run"]
+          "unused_functions": [
+            "run"
+          ]
         },
         "present": {}
       }
@@ -778,7 +919,9 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["full_name"]
+          "unused_functions": [
+            "full_name"
+          ]
         },
         "present": {}
       }
@@ -794,7 +937,58 @@
       },
       "expect": {
         "absent": {
-          "unused_functions": ["setUpClass", "tearDownClass", "setUpModule", "tearDownModule"]
+          "unused_functions": [
+            "setUpClass",
+            "tearDownClass",
+            "setUpModule",
+            "tearDownModule"
+          ]
+        },
+        "present": {}
+      }
+    },
+    {
+      "id": "quadratic-lookup-positive",
+      "path": "fixtures/quadratic_lookup_positive.py",
+      "description": "Joins and repeated list scans that a dict, set or Counter removes.",
+      "source": {
+        "repo": "https://github.com/duriantaco/skylos",
+        "license": "Apache-2.0",
+        "notes": "Hand-written truth-labelled cases for SKY-P403 recall."
+      },
+      "scan": {
+        "enable_quality": true
+      },
+      "expect": {
+        "absent": {},
+        "present": {
+          "quality": [
+            "SKY-P403",
+            "join_scan",
+            "linear_scan_membership",
+            "linear_scan_index",
+            "linear_scan_count"
+          ]
+        }
+      }
+    },
+    {
+      "id": "quadratic-lookup-negative",
+      "path": "fixtures/quadratic_lookup_negative.py",
+      "description": "Pairwise work and non-selecting equalities that no index removes.",
+      "source": {
+        "repo": "https://github.com/duriantaco/skylos",
+        "license": "Apache-2.0",
+        "notes": "Hand-written truth-labelled cases for SKY-P403 precision."
+      },
+      "scan": {
+        "enable_quality": true
+      },
+      "expect": {
+        "absent": {
+          "quality": [
+            "SKY-P403"
+          ]
         },
         "present": {}
       }

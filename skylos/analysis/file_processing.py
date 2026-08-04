@@ -138,7 +138,15 @@ LINTER_RULE_NODE_TYPES = {
         ast.AsyncWith,
         *TRY_NODE_TYPES,
     ),
-    PerformanceRule: (ast.Call, ast.For),
+    # SKY-P403 judges a whole scope at once, so it is dispatched on scopes
+    # rather than on each loop. Keep this in sync with PerformanceRule.visit_node.
+    PerformanceRule: (
+        ast.Call,
+        ast.Module,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Lambda,
+    ),
     TypeAnnotationPracticeRule: (ast.Module,),
     FrameworkPracticeRule: (ast.Module,),
     OpaqueIdentifierRule: (ast.Module,),
