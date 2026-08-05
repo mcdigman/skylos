@@ -12,6 +12,9 @@ _ORIGIN_WRAPPERS = frozenset(
     {"enumerate", "float", "int", "iter", "list", "reversed", "sorted", "str", "tuple"}
 )
 _ALIAS_WRAPPERS = frozenset({"float", "int", "str"})
+_NON_LIST_CALLS = frozenset(
+    {"Counter", "OrderedDict", "bytearray", "bytes", "defaultdict", "deque", "dict", "frozenset", "set"}
+)
 _TRY_NODE_TYPES = (ast.Try, getattr(ast, "TryStar", ast.Try))
 
 
@@ -41,6 +44,13 @@ def _method_call_parts(node):
     ):
         return node.func.value.id, node.func.attr
     return None
+
+
+def _set_membership(names, name, member):
+    if member:
+        names.add(name)
+    else:
+        names.discard(name)
 
 
 def _is_small_literal_iterable(node):
@@ -146,6 +156,13 @@ def _only_continues(body):
     )
 
 
+def _has_impure_call(node):
+    return any(
+        isinstance(child, ast.Call) and _call_func_name(child) not in _ORIGIN_WRAPPERS
+        for child in ast.walk(node)
+    )
+
+
 def _list_parameters(node):
     parameters = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
     return {
@@ -164,15 +181,35 @@ class _P403Collector(ast.NodeVisitor):
         self.bindings = {}
         self.loops = []
         self.local_lists = set()
+        self.small_literals = set()
+        self.non_lists = set()
+        self.loop_assigned = set()
         self.selective_generators = set()
 
     def _visit_scope(self, body, parameter_lists = None):
-        saved = self.bindings, self.loops, self.local_lists
+        saved = (
+            self.bindings,
+            self.loops,
+            self.local_lists,
+            self.small_literals,
+            self.non_lists,
+            self.loop_assigned,
+        )
         self.bindings, self.loops = {}, []
         self.local_lists = parameter_lists or set()
+        self.small_literals = self.small_literals.copy()
+        self.non_lists = self.non_lists.copy()
+        self.loop_assigned = set()
         for statement in body:
             self.visit(statement)
-        self.bindings, self.loops, self.local_lists = saved
+        (
+            self.bindings,
+            self.loops,
+            self.local_lists,
+            self.small_literals,
+            self.non_lists,
+            self.loop_assigned,
+        ) = saved
 
     def visit_Module(self, node):
         self._visit_scope(node.body)
@@ -228,15 +265,27 @@ class _P403Collector(ast.NodeVisitor):
     def _track_assignment(self, target, value):
         if not isinstance(target, ast.Name):
             return
-        if _is_local_list(value) or (isinstance(value, ast.Name) and value.id in self.local_lists):
-            self.local_lists.add(target.id)
-        else:
-            self.local_lists.discard(target.id)
+        name = target.id
+        alias = value.id if isinstance(value, ast.Name) else None
+        _set_membership(
+            self.local_lists, name, _is_local_list(value) or alias in self.local_lists
+        )
+        _set_membership(
+            self.small_literals,
+            name,
+            _is_small_literal_iterable(value) or alias in self.small_literals,
+        )
+        _set_membership(
+            self.non_lists,
+            name,
+            _call_func_name(value) in _NON_LIST_CALLS or alias in self.non_lists,
+        )
+        _set_membership(self.loop_assigned, name, bool(self.loops))
         origin = self._origin(value)
         if origin is None:
-            self.bindings.pop(target.id, None)
+            self.bindings.pop(name, None)
         else:
-            self.bindings[target.id] = origin
+            self.bindings[name] = origin
 
     def visit_Assign(self, node):
         self.visit(node.value)
@@ -259,13 +308,19 @@ class _P403Collector(ast.NodeVisitor):
         name = _list_augassign_target(node)
         if name is None:
             return
+        self.small_literals.discard(name)
         if _is_local_list(node.value) or self._in_unbounded_loop():
             self.local_lists.add(name)
 
     def _push_loop(self, node, target, iterable, body):
         old_bindings = self.bindings.copy()
-        flattening = self._origin(iterable) is not None
-        self.loops.append(_LoopContext(node, _is_small_literal_iterable(iterable), flattening, body))
+        flattening = self._origin(iterable) is not None or (
+            isinstance(iterable, ast.Name) and iterable.id in self.loop_assigned
+        )
+        fixed = _is_small_literal_iterable(iterable) or (
+            isinstance(iterable, ast.Name) and iterable.id in self.small_literals
+        )
+        self.loops.append(_LoopContext(node, fixed, flattening, body))
         if body is not None and self._in_unbounded_loop():
             self.local_lists.update(_grown_lists(body))
         level = len(self.loops) - 1
@@ -470,15 +525,21 @@ class _P403Collector(ast.NodeVisitor):
     def _visit_comprehension(self, generators, result_nodes, *, selective_result = False):
         old_bindings = self.bindings.copy()
         pushed = 0
+        checkable = not any(
+            _has_impure_call(condition)
+            for generator in generators
+            for condition in generator.ifs
+        )
         for generator in generators:
             self.visit(generator.iter)
             self._push_loop(generator, generator.target, generator.iter, None)
             pushed += 1
             for condition in generator.ifs:
-                self._check_join_condition(condition)
+                if checkable:
+                    self._check_join_condition(condition)
                 self.visit(condition)
         for result_node in result_nodes:
-            if selective_result:
+            if selective_result and checkable:
                 self._check_join_condition(result_node)
             self.visit(result_node)
         for _ in range(pushed):
@@ -502,7 +563,11 @@ class _P403Collector(ast.NodeVisitor):
         )
 
     def _add_scan_finding(self, name, operation, node):
-        if name not in self.local_lists or any(loop.fixed for loop in self.loops):
+        if (
+            name not in self.local_lists
+            or name in self.non_lists
+            or all(loop.fixed for loop in self.loops)
+        ):
             return
         messages = {
             "membership": f"Membership checks repeatedly scan locally built list '{name}'. Use a set when duplicates are irrelevant, or maintain counts with collections.Counter.",
@@ -524,6 +589,8 @@ class _P403Collector(ast.NodeVisitor):
         parts = _method_call_parts(node)
         if parts is not None:
             name, operation = parts
+            if operation in {"append", "extend", "insert"}:
+                self.small_literals.discard(name)
             if operation == "extend" and node.args and not _is_small_literal_iterable(node.args[0]):
                 self.local_lists.add(name)
             elif self.loops and operation in {"append", "insert"} and self._in_unbounded_loop():

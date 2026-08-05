@@ -209,6 +209,114 @@ match = lambda: any(
                 self.assertEqual(len(findings), 1)
                 self.assertEqual(findings[0]["name"], "nested_loop")
 
+    def test_detect_subscript_key_joins(self):
+        cases = {
+            "subscript keys": """
+for a in rows_a:
+    for b in rows_b:
+        if a["key"] == b["key"]:
+            emit(a, b)
+""",
+            "lookup keyed by outer loop variable": """
+for a in rows_a:
+    for b in rows_b:
+        if lookup[a] == b.key:
+            emit(a, b)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                findings = self._analyze(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["name"], "nested_loop")
+
+    def test_detect_selective_join_with_pure_filter(self):
+        cases = {
+            "attribute filter": """
+matched = any(
+    left.id == right.id
+    for left in lefts
+    for right in rights
+    if right.active
+)
+""",
+            "wrapper conversions in join": """
+matched = any(
+    str(left.id) == str(right.id)
+    for left in lefts
+    for right in rights
+)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                findings = self._analyze(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["name"], "nested_loop")
+
+    def test_ignore_selective_join_with_impure_filter(self):
+        cases = {
+            "function filter": """
+matched = any(
+    left.id == right.id
+    for left in lefts
+    for right in rights
+    if record_pair(left, right)
+)
+""",
+            "method filter": """
+matched = any(
+    left.id == right.id
+    for left in lefts
+    for right in rights
+    if right.accepts(left)
+)
+""",
+            "impure filter beside condition join": """
+pairs = [
+    (left, right)
+    for left in lefts
+    for right in rights
+    if audit(left, right)
+    if left.id == right.id
+]
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
+
+    def test_detect_join_with_loop_invariant_inner_iterable(self):
+        code = """
+rows = fetch_rows()
+for ref in refs:
+    for row in rows:
+        if row.key == ref.key:
+            emit(row, ref)
+"""
+        findings = self._analyze(code)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["name"], "nested_loop")
+
+    def test_ignore_join_when_inner_iterable_rebuilt_per_iteration(self):
+        cases = {
+            "rebuilt list": """
+for ref in refs:
+    candidates = resolve(ref)
+    for candidate in candidates:
+        if str(candidate.filename) == str(ref.filename):
+            count(candidate)
+""",
+            "rebuilt comprehension input": """
+for ref in refs:
+    candidates = resolve(ref)
+    same_file = [d for d in candidates if str(d.filename) == str(ref.filename)]
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
+
     def test_ignore_noisy_nested_loop_shapes(self):
         cases = {
             "no equality join": """
@@ -329,6 +437,49 @@ for left in lefts:
         normalized = sorted(left.values)
         if left.id == right.id:
             remember(normalized, right)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
+
+    def test_ignore_inert_and_outer_guard_shapes(self):
+        cases = {
+            "pass-only inverse guard": """
+for left in lefts:
+    for right in rights:
+        if left.id != right.id:
+            pass
+        remember(left, right)
+""",
+            "join between outer loops only": """
+for a in xs:
+    for b in ys:
+        for c in zs:
+            if a.key == b.key:
+                emit(a, b, c)
+""",
+            "guard nested inside unrelated if": """
+for left in lefts:
+    for right in rights:
+        if enabled:
+            if left.id == right.id:
+                remember(left, right)
+""",
+            "dict literal iterable": """
+for a in rows:
+    for key in {"alpha": 1, "beta": 2}:
+        if a.key == key:
+            emit(a, key)
+""",
+            "indexed while with else": """
+i = 0
+while i < len(orders):
+    order = orders[i]
+    consume(order)
+    i += 1
+else:
+    finish()
 """,
         }
         for label, code in cases.items():
@@ -493,6 +644,119 @@ for item in items:
     dynamic.remove(item)
 """
         self.assertEqual(self._analyze(code), [])
+
+    def test_ignore_scans_inside_small_literal_alias_loops(self):
+        cases = {
+            "local alias comprehension": """
+function_names = [f.name for f in results]
+magic_methods = ["setUp", "tearDown", "setUpClass"]
+flagged = [method for method in magic_methods if method in function_names]
+""",
+            "module constant used in method": """
+ROOT_NAMES = {"src", "lib", "python"}
+
+class Resolver:
+    def module_parts(self, f, root):
+        parts = list(f.relative_to(root).parts)
+        for name in ROOT_NAMES:
+            if name not in parts:
+                continue
+            use(parts.index(name))
+        return parts
+""",
+            "alias of alias": """
+KNOWN = ("alpha", "beta")
+also_known = KNOWN
+values = list(source)
+for name in also_known:
+    if name in values:
+        emit(name)
+""",
+            "nested fixed loops": """
+values = list(source)
+for tag in ["alpha", "beta"]:
+    for name in ("one", "two", "three"):
+        if name in values:
+            emit(tag, name)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
+
+    def test_detect_scan_under_fixed_outer_loop_with_unbounded_inner(self):
+        code = """
+results = []
+for pattern in ["alpha", "beta"]:
+    for line in run(pattern).splitlines():
+        if line not in results:
+            results.append(line)
+"""
+        findings = self._analyze(code)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_detect_scans_after_small_literal_alias_grows(self):
+        cases = {
+            "augmented growth": """
+tags = ["alpha", "beta"]
+tags += list(source)
+values = list(source)
+for tag in tags:
+    if tag in values:
+        emit(tag)
+""",
+            "method growth": """
+tags = ["alpha", "beta"]
+tags.extend(source)
+values = list(source)
+for tag in tags:
+    if tag in values:
+        emit(tag)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                findings = self._analyze(code)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_ignore_non_list_builtin_containers(self):
+        cases = {
+            "bytearray delimiter scan": """
+def read_request(sock, delimiter):
+    request = bytearray()
+    while delimiter not in request and len(request) <= 65536:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return request
+        request.extend(chunk)
+    return request
+""",
+            "deque growth": """
+def recent(items):
+    window = deque()
+    for item in items:
+        window.append(item)
+        if item in window:
+            emit(item)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
+
+    def test_detect_list_growth_in_plain_while(self):
+        code = """
+def read_lines(stream, sentinel):
+    lines = []
+    while sentinel not in lines:
+        lines.append(stream.readline())
+    return lines
+"""
+        findings = self._analyze(code)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["name"], "list_membership")
 
     def test_detect_unbounded_orm_all(self):
         code = """
