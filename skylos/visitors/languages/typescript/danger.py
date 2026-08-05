@@ -611,12 +611,20 @@ def _child_process_aliases(root_node, lang: Language, source_bytes: bytes) -> se
     return aliases
 
 
+def _field_matches_node(
+    node: Node | None, field_name: str, expected_node: Node
+) -> bool:
+    if node is None:
+        return False
+    field_node = node.child_by_field_name(field_name)
+    return field_node is not None and field_node.id == expected_node.id
+
+
 def _regexp_use_kind(node: Node, source_bytes: bytes) -> str | None:
     member_node = node.parent
     if member_node is None or member_node.type != "member_expression":
         return None
-    object_node = member_node.child_by_field_name("object")
-    if object_node is None or object_node.id != node.id:
+    if not _field_matches_node(member_node, "object", node):
         return None
 
     property_node = member_node.child_by_field_name("property")
@@ -625,26 +633,17 @@ def _regexp_use_kind(node: Node, source_bytes: bytes) -> str | None:
     property_name = _get_text(source_bytes, property_node)
 
     call_node = member_node.parent
-    function_node = (
-        call_node.child_by_field_name("function") if call_node is not None else None
-    )
-    if property_name in _REGEXP_PROOF_METHODS and (
-        call_node is not None
-        and call_node.type == "call_expression"
-        and function_node is not None
-        and function_node.id == member_node.id
+    if (
+        property_name in _REGEXP_PROOF_METHODS
+        and getattr(call_node, "type", None) == "call_expression"
+        and _field_matches_node(call_node, "function", member_node)
     ):
         return property_name
 
-    parent = member_node.parent
-    left_node = parent.child_by_field_name("left") if parent is not None else None
-    is_write = parent is not None and (
-        (
-            parent.type in {"assignment_expression", "augmented_assignment_expression"}
-            and left_node is not None
-            and left_node.id == member_node.id
-        )
-        or parent.type == "update_expression"
+    parent_type = getattr(call_node, "type", None)
+    is_write = parent_type == "update_expression" or (
+        parent_type in {"assignment_expression", "augmented_assignment_expression"}
+        and _field_matches_node(call_node, "left", member_node)
     )
     if property_name in _REGEXP_PROOF_PROPERTIES and (
         not is_write or property_name == "lastIndex"
@@ -683,6 +682,32 @@ def _is_directly_exported_binding(node: Node) -> bool:
     return export is not None and export.type == "export_statement"
 
 
+def _unique_regexp_bindings(
+    nodes: list[Node], source_bytes: bytes
+) -> dict[tuple[int, str], Node]:
+    declarations: dict[tuple[int, str], list[Node]] = {}
+    for node in nodes:
+        scope = _regexp_binding_scope(node)
+        if scope is not None:
+            key = (scope.id, _get_text(source_bytes, node))
+            declarations.setdefault(key, []).append(node)
+    return {
+        key: bindings[0] for key, bindings in declarations.items() if len(bindings) == 1
+    }
+
+
+def _nearest_regexp_binding_key(
+    node: Node, name: str, candidates: dict[tuple[int, str], Node]
+) -> tuple[int, str] | None:
+    current = node.parent
+    while current is not None:
+        key = (current.id, name)
+        if current.type in _REGEXP_BINDING_SCOPE_TYPES and key in candidates:
+            return key
+        current = current.parent
+    return None
+
+
 def _proven_regexp_exec_receivers(
     root_node: Node, lang: Language, source_bytes: bytes
 ) -> set[int]:
@@ -692,21 +717,10 @@ def _proven_regexp_exec_receivers(
         "danger_regexp_literal_bindings",
         _REGEXP_LITERAL_BINDING_PATTERN,
     )
-    declarations: dict[tuple[int, str], list[Node]] = {}
-    for node in captures.get("regexp_name", []):
-        scope = _regexp_binding_scope(node)
-        if scope is not None:
-            key = (scope.id, _get_text(source_bytes, node))
-            declarations.setdefault(key, []).append(node)
-
-    candidates = {key for key, nodes in declarations.items() if len(nodes) == 1}
-    declaration_ids = {
-        nodes[0].id for key, nodes in declarations.items() if key in candidates
-    }
+    candidates = _unique_regexp_bindings(captures.get("regexp_name", []), source_bytes)
+    declaration_ids = {node.id for node in candidates.values()}
     invalid = {
-        key
-        for key, nodes in declarations.items()
-        if key in candidates and _is_directly_exported_binding(nodes[0])
+        key for key, node in candidates.items() if _is_directly_exported_binding(node)
     }
     exec_receivers: dict[tuple[int, str], set[int]] = {}
     stack = [root_node]
@@ -714,17 +728,7 @@ def _proven_regexp_exec_receivers(
         node = stack.pop()
         if _is_regexp_name_node(node) and node.id not in declaration_ids:
             name = _get_text(source_bytes, node)
-            current = node.parent
-            binding_key: tuple[int, str] | None = None
-            while current is not None:
-                candidate = (current.id, name)
-                if (
-                    current.type in _REGEXP_BINDING_SCOPE_TYPES
-                    and candidate in candidates
-                ):
-                    binding_key = candidate
-                    break
-                current = current.parent
+            binding_key = _nearest_regexp_binding_key(node, name, candidates)
             if binding_key is not None:
                 use_kind = _regexp_use_kind(node, source_bytes)
                 if use_kind == "exec":
