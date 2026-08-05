@@ -151,6 +151,32 @@ class TestTSDangerRules:
         assert "SKY-D212" not in ids
 
     @pytest.mark.parametrize(
+        "initializer",
+        [
+            "(/github\\.com/)",
+            "/github\\.com/ as RegExp",
+            "/github\\.com/ satisfies RegExp",
+            "((/github\\.com/) as RegExp) satisfies RegExp",
+        ],
+    )
+    def test_wrapped_regexp_literal_exec_not_flagged(self, tmp_path, initializer):
+        code = f"const pattern = {initializer};\npattern.exec(url);\n"
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        ids = {f["rule_id"] for f in danger}
+        assert "SKY-D212" not in ids
+
+    def test_read_only_regexp_prototype_use_preserves_proof(self, tmp_path):
+        code = (
+            "Other.prototype.exec = replacement;\n"
+            "const nativeExec = RegExp.prototype.exec;\n"
+            "const pattern = /github\\.com/;\n"
+            "pattern.exec(url);\n"
+        )
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        ids = {f["rule_id"] for f in danger}
+        assert "SKY-D212" not in ids
+
+    @pytest.mark.parametrize(
         ("code", "expected_line"),
         [
             (
@@ -161,6 +187,52 @@ class TestTSDangerRules:
                     "GITHUB_PATTERN.exec(cmd);\n"
                 ),
                 4,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "RegExp.prototype.exec = cp.exec;\n"
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                4,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    'Object.defineProperty(RegExp.prototype, "exec", '
+                    "{ value: cp.exec });\n"
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                4,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    'RegExp["prototype"]["exec"] = cp.exec;\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                4,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const prototype = RegExp.prototype;\n"
+                    "prototype.exec = cp.exec;\n"
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                5,
+            ),
+            (
+                (
+                    "delete RegExp.prototype.exec;\n"
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                3,
             ),
             (
                 (
@@ -266,6 +338,11 @@ class TestTSDangerRules:
         ],
         ids=[
             "property-replaced",
+            "regexp-prototype-assignment",
+            "regexp-prototype-define-property",
+            "regexp-prototype-computed-assignment",
+            "regexp-prototype-alias",
+            "regexp-prototype-delete",
             "binding-shadowed",
             "safe-looking-alias",
             "object-destructuring-shadow",

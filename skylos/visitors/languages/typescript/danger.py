@@ -129,7 +129,7 @@ _REGEXP_LITERAL_BINDING_PATTERN = """
   "const"
   (variable_declarator
     name: (identifier) @regexp_name
-    value: (regex)))
+    value: (_)))
 """
 
 _REGEXP_BINDING_SCOPE_TYPES = {
@@ -620,6 +620,62 @@ def _field_matches_node(
     return field_node is not None and field_node.id == expected_node.id
 
 
+def _static_member_path(node: Node | None, source_bytes: bytes) -> tuple[str, ...] | None:
+    if node is None:
+        return None
+    node = _unwrap_ts_expression(node)
+    if node.type == "identifier":
+        return (_get_text(source_bytes, node),)
+    object_node = node.child_by_field_name("object")
+    if node.type == "member_expression":
+        property_node = node.child_by_field_name("property")
+        property_name = (
+            _get_text(source_bytes, property_node)
+            if property_node is not None
+            else None
+        )
+    elif node.type == "subscript_expression":
+        property_name = _static_string_value(
+            node.child_by_field_name("index"), source_bytes
+        )
+    else:
+        return None
+    object_path = _static_member_path(object_node, source_bytes)
+    if object_path is None or property_name is None:
+        return None
+    return (*object_path, property_name)
+
+
+def _is_delete_expression(node: Node) -> bool:
+    if not node.children:
+        return False
+    return (node.type, node.children[0].type) == ("unary_expression", "delete")
+
+
+def _invalidates_regexp_exec_proof(node: Node, source_bytes: bytes) -> bool:
+    path = _static_member_path(node, source_bytes)
+    prototype_path = ("RegExp", "prototype")
+    if path == prototype_path:
+        parent_path = _static_member_path(node.parent, source_bytes)
+        return parent_path is None or parent_path[:2] != prototype_path
+    if path != (*prototype_path, "exec"):
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    left_node = parent.child_by_field_name("left")
+    is_assignment = (
+        parent.type in {"assignment_expression", "augmented_assignment_expression"}
+        and left_node is not None
+        and left_node.id == node.id
+    )
+    return (
+        is_assignment
+        or _is_delete_expression(parent)
+        or parent.type == "update_expression"
+    )
+
+
 def _regexp_use_kind(node: Node, source_bytes: bytes) -> str | None:
     member_node = node.parent
     if member_node is None or member_node.type != "member_expression":
@@ -687,6 +743,16 @@ def _unique_regexp_bindings(
 ) -> dict[tuple[int, str], Node]:
     declarations: dict[tuple[int, str], list[Node]] = {}
     for node in nodes:
+        value_node = node.parent.child_by_field_name("value")
+        if value_node is None:
+            continue
+        while value_node.type in _TS_EXPRESSION_WRAPPERS:
+            unwrapped = _unwrap_ts_expression(value_node)
+            if unwrapped is value_node:
+                break
+            value_node = unwrapped
+        if value_node.type != "regex":
+            continue
         scope = _regexp_binding_scope(node)
         if scope is not None:
             key = (scope.id, _get_text(source_bytes, node))
@@ -726,6 +792,8 @@ def _proven_regexp_exec_receivers(
     stack = [root_node]
     while stack:
         node = stack.pop()
+        if _invalidates_regexp_exec_proof(node, source_bytes):
+            return set()
         if _is_regexp_name_node(node) and node.id not in declaration_ids:
             name = _get_text(source_bytes, node)
             binding_key = _nearest_regexp_binding_key(node, name, candidates)
