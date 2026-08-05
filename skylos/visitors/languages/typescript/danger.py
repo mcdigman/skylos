@@ -132,6 +132,23 @@ _REGEXP_LITERAL_BINDING_PATTERN = """
     value: (regex)))
 """
 
+_REGEXP_BINDING_SCOPE_TYPES = {
+    "for_in_statement",
+    "for_statement",
+    "program",
+    "statement_block",
+    "switch_body",
+}
+
+_REGEXP_IDENTIFIER_TYPES = {
+    "identifier",
+    "shorthand_property_identifier",
+    "shorthand_property_identifier_pattern",
+}
+
+_REGEXP_PROOF_METHODS = {"exec", "test"}
+_REGEXP_PROOF_PROPERTIES = {"flags", "lastIndex", "source"}
+
 _INTERNAL_URL_PREFIXES = (
     "http://localhost",
     "http://127.0.0.1",
@@ -594,60 +611,132 @@ def _child_process_aliases(root_node, lang: Language, source_bytes: bytes) -> se
     return aliases
 
 
-def _is_regexp_exec_call_receiver(node: Node, source_bytes: bytes) -> bool:
+def _regexp_use_kind(node: Node, source_bytes: bytes) -> str | None:
     member_node = node.parent
     if member_node is None or member_node.type != "member_expression":
-        return False
-    if member_node.child_by_field_name("object") != node:
-        return False
+        return None
+    object_node = member_node.child_by_field_name("object")
+    if object_node is None or object_node.id != node.id:
+        return None
 
     property_node = member_node.child_by_field_name("property")
-    if property_node is None or _get_text(source_bytes, property_node) != "exec":
-        return False
+    if property_node is None:
+        return None
+    property_name = _get_text(source_bytes, property_node)
 
     call_node = member_node.parent
-    return (
+    function_node = (
+        call_node.child_by_field_name("function") if call_node is not None else None
+    )
+    if property_name in _REGEXP_PROOF_METHODS and (
         call_node is not None
         and call_node.type == "call_expression"
-        and call_node.child_by_field_name("function") == member_node
+        and function_node is not None
+        and function_node.id == member_node.id
+    ):
+        return property_name
+
+    parent = member_node.parent
+    left_node = parent.child_by_field_name("left") if parent is not None else None
+    is_write = parent is not None and (
+        (
+            parent.type in {"assignment_expression", "augmented_assignment_expression"}
+            and left_node is not None
+            and left_node.id == member_node.id
+        )
+        or parent.type == "update_expression"
+    )
+    if property_name in _REGEXP_PROOF_PROPERTIES and not is_write:
+        return "property_read"
+    return None
+
+
+def _regexp_binding_scope(node: Node) -> Node | None:
+    current = node.parent
+    while current is not None:
+        if current.type in _REGEXP_BINDING_SCOPE_TYPES:
+            return current
+        current = current.parent
+    return None
+
+
+def _is_regexp_name_node(node: Node) -> bool:
+    if node.type in _REGEXP_IDENTIFIER_TYPES:
+        return True
+    parent = node.parent
+    name_node = parent.child_by_field_name("name") if parent is not None else None
+    return (
+        node.type == "type_identifier"
+        and parent is not None
+        and parent.type in {"class", "class_declaration"}
+        and name_node is not None
+        and name_node.id == node.id
     )
 
 
-def _proven_regexp_literal_bindings(
+def _is_directly_exported_binding(node: Node) -> bool:
+    declarator = node.parent
+    declaration = declarator.parent if declarator is not None else None
+    export = declaration.parent if declaration is not None else None
+    return export is not None and export.type == "export_statement"
+
+
+def _proven_regexp_exec_receivers(
     root_node: Node, lang: Language, source_bytes: bytes
-) -> set[str]:
+) -> set[int]:
     captures = _run_batch(
         root_node,
         lang,
         "danger_regexp_literal_bindings",
         _REGEXP_LITERAL_BINDING_PATTERN,
     )
-    declarations: dict[str, list[Node]] = {}
+    declarations: dict[tuple[int, str], list[Node]] = {}
     for node in captures.get("regexp_name", []):
-        declarations.setdefault(_get_text(source_bytes, node), []).append(node)
+        scope = _regexp_binding_scope(node)
+        if scope is not None:
+            key = (scope.id, _get_text(source_bytes, node))
+            declarations.setdefault(key, []).append(node)
 
-    candidates = {name for name, nodes in declarations.items() if len(nodes) == 1}
-    declaration_ranges = {
-        (nodes[0].start_byte, nodes[0].end_byte)
-        for name, nodes in declarations.items()
-        if name in candidates
+    candidates = {key for key, nodes in declarations.items() if len(nodes) == 1}
+    declaration_ids = {
+        nodes[0].id for key, nodes in declarations.items() if key in candidates
     }
-    invalid: set[str] = set()
+    invalid = {
+        key
+        for key, nodes in declarations.items()
+        if key in candidates and _is_directly_exported_binding(nodes[0])
+    }
+    exec_receivers: dict[tuple[int, str], set[int]] = {}
     stack = [root_node]
     while stack:
         node = stack.pop()
-        if node.type == "identifier":
+        if _is_regexp_name_node(node) and node.id not in declaration_ids:
             name = _get_text(source_bytes, node)
-            location = (node.start_byte, node.end_byte)
-            if (
-                name in candidates
-                and location not in declaration_ranges
-                and not _is_regexp_exec_call_receiver(node, source_bytes)
-            ):
-                invalid.add(name)
+            current = node.parent
+            binding_key: tuple[int, str] | None = None
+            while current is not None:
+                candidate = (current.id, name)
+                if (
+                    current.type in _REGEXP_BINDING_SCOPE_TYPES
+                    and candidate in candidates
+                ):
+                    binding_key = candidate
+                    break
+                current = current.parent
+            if binding_key is not None:
+                use_kind = _regexp_use_kind(node, source_bytes)
+                if use_kind == "exec":
+                    exec_receivers.setdefault(binding_key, set()).add(node.id)
+                elif use_kind is None:
+                    invalid.add(binding_key)
         stack.extend(reversed(node.children))
 
-    return candidates - invalid
+    return {
+        receiver_id
+        for key, receiver_ids in exec_receivers.items()
+        if key not in invalid
+        for receiver_id in receiver_ids
+    }
 
 
 def _template_prefix(node, source_bytes: bytes) -> str:
@@ -844,8 +933,11 @@ def scan_danger(
     jsx_captures = _run_batch(root_node, lang, "danger_jsx", _JSX_PATTERN)
     complex_captures = _run_batch(root_node, lang, "danger_complex", _COMPLEX_PATTERN)
     child_process_aliases = _child_process_aliases(root_node, lang, source_bytes)
-    regexp_literal_bindings = _proven_regexp_literal_bindings(
-        root_node, lang, source_bytes
+    exec_prop_nodes = complex_captures.get("exec_prop", [])
+    regexp_exec_receivers = (
+        _proven_regexp_exec_receivers(root_node, lang, source_bytes)
+        if exec_prop_nodes
+        else set()
     )
     static_string_bindings = _collect_static_string_bindings(root_node, source_bytes)
 
@@ -877,7 +969,7 @@ def scan_danger(
                 }
             )
 
-    for prop_node in complex_captures.get("exec_prop", []):
+    for prop_node in exec_prop_nodes:
         member_node = prop_node.parent
         if member_node is None:
             continue
@@ -886,7 +978,7 @@ def scan_danger(
             continue
         raw_obj_name = _get_text(source_bytes, obj_node)
         obj_name = raw_obj_name.lower()
-        if raw_obj_name in regexp_literal_bindings:
+        if obj_node.id in regexp_exec_receivers:
             continue
         if (
             obj_name in _SAFE_DATABASE_EXEC_OBJECTS

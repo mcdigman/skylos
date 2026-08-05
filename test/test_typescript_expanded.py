@@ -110,6 +110,45 @@ class TestTSDangerRules:
         ids = {f["rule_id"] for f in danger}
         assert "SKY-D212" not in ids
 
+    def test_same_regexp_name_in_sibling_scopes_not_flagged(self, tmp_path):
+        code = (
+            "{\n"
+            "  const pattern = /github\\.com/;\n"
+            "  pattern.exec(firstUrl);\n"
+            "}\n"
+            "{\n"
+            "  const pattern = /gitlab\\.com/;\n"
+            "  pattern.exec(secondUrl);\n"
+            "}\n"
+        )
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        ids = {f["rule_id"] for f in danger}
+        assert "SKY-D212" not in ids
+
+    def test_nested_regexp_bindings_not_flagged(self, tmp_path):
+        code = (
+            "const pattern = /github\\.com/;\n"
+            "pattern.exec(firstUrl);\n"
+            "function matchGitLab(secondUrl) {\n"
+            "  const pattern = /gitlab\\.com/;\n"
+            "  pattern.exec(secondUrl);\n"
+            "}\n"
+        )
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        ids = {f["rule_id"] for f in danger}
+        assert "SKY-D212" not in ids
+
+    def test_regexp_test_and_property_reads_preserve_proof(self, tmp_path):
+        code = (
+            "const pattern = /github\\.com/g;\n"
+            "pattern.test(url);\n"
+            "console.log(pattern.source, pattern.flags, pattern.lastIndex);\n"
+            "pattern.exec(url);\n"
+        )
+        _, _, _, danger = _scan_ts(tmp_path, code)
+        ids = {f["rule_id"] for f in danger}
+        assert "SKY-D212" not in ids
+
     @pytest.mark.parametrize(
         ("code", "expected_line"),
         [
@@ -139,8 +178,89 @@ class TestTSDangerRules:
                 ),
                 3,
             ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "function run(cmd) {\n"
+                    "  const { GITHUB_PATTERN } = { GITHUB_PATTERN: cp };\n"
+                    "  GITHUB_PATTERN.exec(cmd);\n"
+                    "}\n"
+                ),
+                5,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "function run(cmd) {\n"
+                    "  const [GITHUB_PATTERN] = [cp];\n"
+                    "  GITHUB_PATTERN.exec(cmd);\n"
+                    "}\n"
+                ),
+                5,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "function run(cmd) {\n"
+                    "  class GITHUB_PATTERN { static exec = cp.exec; }\n"
+                    "  GITHUB_PATTERN.exec(cmd);\n"
+                    "}\n"
+                ),
+                5,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "const holder = { GITHUB_PATTERN };\n"
+                    "holder.GITHUB_PATTERN.exec = cp.exec;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                5,
+            ),
+            (
+                (
+                    'import cp from "child_process";\n'
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "const carrier = {\n"
+                    "  match(pattern) { pattern.exec = cp.exec; },\n"
+                    "};\n"
+                    "carrier.match(GITHUB_PATTERN);\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                7,
+            ),
+            (
+                (
+                    "export const GITHUB_PATTERN = /github\\.com/;\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                2,
+            ),
+            (
+                (
+                    "const GITHUB_PATTERN = /github\\.com/;\n"
+                    "export { GITHUB_PATTERN };\n"
+                    "GITHUB_PATTERN.exec(cmd);\n"
+                ),
+                3,
+            ),
         ],
-        ids=["property-replaced", "binding-shadowed", "safe-looking-alias"],
+        ids=[
+            "property-replaced",
+            "binding-shadowed",
+            "safe-looking-alias",
+            "object-destructuring-shadow",
+            "array-destructuring-shadow",
+            "class-shadow",
+            "shorthand-escape",
+            "custom-match-escape",
+            "direct-export",
+            "re-export",
+        ],
     )
     def test_regex_lookalikes_remain_flagged(self, tmp_path, code, expected_line):
         _, _, _, danger = _scan_ts(tmp_path, code)
