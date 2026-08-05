@@ -138,12 +138,13 @@ class TestTSDangerRules:
         ids = {f["rule_id"] for f in danger}
         assert "SKY-D212" not in ids
 
-    def test_regexp_test_and_property_reads_preserve_proof(self, tmp_path):
+    def test_regexp_safe_uses_preserve_proof(self, tmp_path):
         code = (
             "const pattern = /github\\.com/g;\n"
             "pattern.test(url);\n"
             "console.log(pattern.source, pattern.flags, pattern.lastIndex);\n"
-            "pattern.exec(url);\n"
+            "pattern.lastIndex = 0;\n"
+            "while ((match = pattern.exec(url)) !== null) {}\n"
         )
         _, _, _, danger = _scan_ts(tmp_path, code)
         ids = {f["rule_id"] for f in danger}
@@ -248,6 +249,20 @@ class TestTSDangerRules:
                 ),
                 3,
             ),
+            (
+                (
+                    'const pattern = new RegExp("github.com");\n'
+                    "pattern.exec(url);\n"
+                ),
+                2,
+            ),
+            (
+                (
+                    "let pattern = /github\\.com/;\n"
+                    "pattern.exec(url);\n"
+                ),
+                2,
+            ),
         ],
         ids=[
             "property-replaced",
@@ -260,6 +275,8 @@ class TestTSDangerRules:
             "custom-match-escape",
             "direct-export",
             "re-export",
+            "regexp-constructor",
+            "mutable-regexp-binding",
         ],
     )
     def test_regex_lookalikes_remain_flagged(self, tmp_path, code, expected_line):

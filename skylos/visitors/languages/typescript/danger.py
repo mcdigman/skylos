@@ -646,7 +646,9 @@ def _regexp_use_kind(node: Node, source_bytes: bytes) -> str | None:
         )
         or parent.type == "update_expression"
     )
-    if property_name in _REGEXP_PROOF_PROPERTIES and not is_write:
+    if property_name in _REGEXP_PROOF_PROPERTIES and (
+        not is_write or property_name == "lastIndex"
+    ):
         return "property_read"
     return None
 
