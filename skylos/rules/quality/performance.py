@@ -13,6 +13,7 @@ ScanOperation: TypeAlias = Literal["count", "index", "membership"]
 _ORIGIN_WRAPPERS = frozenset(
     {"enumerate", "float", "int", "iter", "list", "reversed", "sorted", "str", "tuple"}
 )
+_ALIAS_WRAPPERS = frozenset({"float", "int", "str"})
 _TRY_NODE_TYPES = (ast.Try, getattr(ast, "TryStar", ast.Try))
 
 
@@ -31,7 +32,16 @@ class _LoopContext(NamedTuple):
 def _is_small_literal_iterable(node: ast.expr) -> bool:
     if isinstance(node, ast.Dict):
         return len(node.keys) <= 8
-    return isinstance(node, (ast.List, ast.Set, ast.Tuple)) and len(node.elts) <= 8
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return len(node.elts) <= 8
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"list", "set", "tuple"}
+        and len(node.args) == 1
+        and not node.keywords
+        and _is_small_literal_iterable(node.args[0])
+    )
 
 
 def _is_local_list(node: ast.expr) -> bool:
@@ -133,10 +143,6 @@ def _wrapped_guard_siblings(
 
 def _list_parameters(node: ast.AsyncFunctionDef | ast.FunctionDef) -> set[str]:
     parameters = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
-    if node.args.vararg is not None:
-        parameters.append(node.args.vararg)
-    if node.args.kwarg is not None:
-        parameters.append(node.args.kwarg)
     return {
         parameter.arg
         for parameter in parameters
@@ -152,19 +158,18 @@ class _P403Collector(ast.NodeVisitor):
         self.findings: list[Finding] = []
         self.bindings: dict[str, _Origin] = {}
         self.loops: list[_LoopContext] = []
-        self.grown_lists: set[str] = set()
         self.local_lists: set[str] = set()
+        self.selective_generators: set[int] = set()
 
     def _visit_scope(
         self, body: list[ast.stmt], parameter_lists: set[str] | None = None
     ) -> None:
-        saved = self.bindings, self.loops, self.grown_lists, self.local_lists
-        self.grown_lists = _grown_lists(body)
+        saved = self.bindings, self.loops, self.local_lists
         self.bindings, self.loops = {}, []
-        self.local_lists = self.grown_lists | (parameter_lists or set())
+        self.local_lists = parameter_lists or set()
         for statement in body:
             self.visit(statement)
-        self.bindings, self.loops, self.grown_lists, self.local_lists = saved
+        self.bindings, self.loops, self.local_lists = saved
 
     def visit_Module(self, node: ast.Module) -> None:
         self._visit_scope(node.body)
@@ -175,7 +180,10 @@ class _P403Collector(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        pass
+        saved = self.bindings, self.loops, self.local_lists
+        self.bindings, self.loops, self.local_lists = {}, [], set()
+        self.visit(node.body)
+        self.bindings, self.loops, self.local_lists = saved
 
     def _origin(self, node: ast.expr) -> _Origin | None:
         if isinstance(node, ast.Name):
@@ -224,7 +232,9 @@ class _P403Collector(ast.NodeVisitor):
     def _track_assignment(self, target: ast.expr, value: ast.expr) -> None:
         if not isinstance(target, ast.Name):
             return
-        if _is_local_list(value) or target.id in self.grown_lists:
+        if _is_local_list(value) or (
+            isinstance(value, ast.Name) and value.id in self.local_lists
+        ):
             self.local_lists.add(target.id)
         else:
             self.local_lists.discard(target.id)
@@ -247,6 +257,17 @@ class _P403Collector(ast.NodeVisitor):
         self.visit(node.value)
         self._track_assignment(node.target, node.value)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.generic_visit(node)
+        if not (
+            isinstance(node.op, ast.Add)
+            and isinstance(node.target, ast.Name)
+            and _is_list_extension(node.value)
+        ):
+            return
+        if _is_local_list(node.value) or any(not loop.fixed for loop in self.loops):
+            self.local_lists.add(node.target.id)
+
     def _push_loop(
         self,
         node: LoopNode,
@@ -264,6 +285,8 @@ class _P403Collector(ast.NodeVisitor):
                 body=body,
             )
         )
+        if body is not None and any(not loop.fixed for loop in self.loops):
+            self.local_lists.update(_grown_lists(body))
         level = len(self.loops) - 1
         for child in ast.walk(target):
             if isinstance(child, ast.Name):
@@ -275,10 +298,10 @@ class _P403Collector(ast.NodeVisitor):
         old_bindings = self._push_loop(node, node.target, node.iter, node.body)
         for statement in node.body:
             self.visit(statement)
-        for statement in node.orelse:
-            self.visit(statement)
         self.loops.pop()
         self.bindings = old_bindings
+        for statement in node.orelse:
+            self.visit(statement)
 
     visit_AsyncFor = visit_For
 
@@ -312,8 +335,13 @@ class _P403Collector(ast.NodeVisitor):
         binding = self._while_binding(node)
         if binding is None:
             self.loops.append(_LoopContext(node, False, False, node.body))
-            self.generic_visit(node)
+            self.local_lists.update(_grown_lists(node.body))
+            self.visit(node.test)
+            for statement in node.body:
+                self.visit(statement)
             self.loops.pop()
+            for statement in node.orelse:
+                self.visit(statement)
             return
         assignment, index_name, iterable = binding
         loop_body = [
@@ -327,13 +355,14 @@ class _P403Collector(ast.NodeVisitor):
             )
         ]
         old_bindings = self._push_loop(node, assignment.targets[0], iterable, loop_body)
+        self.visit(node.test)
         for statement in node.body:
             if statement is not assignment:
                 self.visit(statement)
-        for statement in node.orelse:
-            self.visit(statement)
         self.loops.pop()
         self.bindings = old_bindings
+        for statement in node.orelse:
+            self.visit(statement)
 
     def _matching_comparison(
         self,
@@ -356,7 +385,7 @@ class _P403Collector(ast.NodeVisitor):
         if allow_and and isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
             for value in test.values:
                 comparison = self._matching_comparison(value, operator)
-                if comparison is not None:
+                if comparison is not None and self._is_join_comparison(comparison):
                     return comparison
         return None
 
@@ -375,11 +404,18 @@ class _P403Collector(ast.NodeVisitor):
                 return False
         return True
 
+    def _is_alias_expression(self, node: ast.expr) -> bool:
+        return self._origin(node) is not None and all(
+            not isinstance(child, ast.Call)
+            or (isinstance(child.func, ast.Name) and child.func.id in _ALIAS_WRAPPERS)
+            for child in ast.walk(node)
+        )
+
     def _is_alias_statement(self, node: ast.stmt) -> bool:
         return isinstance(node, ast.Pass) or (
             isinstance(node, (ast.AnnAssign, ast.Assign))
             and node.value is not None
-            and self._origin(node.value) is not None
+            and self._is_alias_expression(node.value)
         )
 
     @staticmethod
@@ -476,6 +512,8 @@ class _P403Collector(ast.NodeVisitor):
         self,
         generators: list[ast.comprehension],
         result_nodes: tuple[ast.expr, ...],
+        *,
+        selective_result: bool = False,
     ) -> None:
         old_bindings = self.bindings.copy()
         pushed = 0
@@ -490,7 +528,7 @@ class _P403Collector(ast.NodeVisitor):
                         self._add_join_finding(condition)
                 self.visit(condition)
         for result_node in result_nodes:
-            if len(self.loops) >= 2:
+            if selective_result and len(self.loops) >= 2:
                 comparison = self._matching_comparison(result_node, ast.Eq)
                 if comparison is not None and self._is_join_comparison(comparison):
                     self._add_join_finding(result_node)
@@ -509,7 +547,11 @@ class _P403Collector(ast.NodeVisitor):
         self._visit_comprehension(node.generators, (node.key, node.value))
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        self._visit_comprehension(node.generators, (node.elt,))
+        self._visit_comprehension(
+            node.generators,
+            (node.elt,),
+            selective_result=id(node) in self.selective_generators,
+        )
 
     def _add_scan_finding(
         self, name: str, operation: ScanOperation, node: ast.AST
@@ -526,14 +568,36 @@ class _P403Collector(ast.NodeVisitor):
             self.findings.append(finding)
 
     def visit_Call(self, node: ast.Call) -> None:
+        selective_generator = (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "any"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.GeneratorExp)
+        )
+        if selective_generator:
+            self.selective_generators.add(id(node.args[0]))
         if isinstance(node.func, ast.Attribute) and isinstance(
             node.func.value, ast.Name
         ):
             name = node.func.value.id
             operation = node.func.attr
+            if (
+                operation == "extend"
+                and node.args
+                and not _is_small_literal_iterable(node.args[0])
+            ):
+                self.local_lists.add(name)
+            elif (
+                self.loops
+                and operation in {"append", "insert"}
+                and any(not loop.fixed for loop in self.loops)
+            ):
+                self.local_lists.add(name)
             if self.loops and operation in {"count", "index"}:
                 self._add_scan_finding(name, cast(ScanOperation, operation), node)
         self.generic_visit(node)
+        if selective_generator:
+            self.selective_generators.remove(id(node.args[0]))
 
     def visit_Compare(self, node: ast.Compare) -> None:
         if self.loops:

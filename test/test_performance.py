@@ -133,6 +133,12 @@ for user in users:
         except LookupError:
             pass
 """,
+            "unrelated equality first": """
+for user in users:
+    for order in orders:
+        if user.active == expected and user.id == order.user_id:
+            emit(user, order)
+""",
         }
         for label, code in cases.items():
             with self.subTest(label):
@@ -188,6 +194,13 @@ paths = [
     for group in groups
     for seed in seeds
 ]
+""",
+            "independent lambda": """
+match = lambda: any(
+    left.id == right.id
+    for left in lefts
+    for right in rights
+)
 """,
         }
         for label, code in cases.items():
@@ -296,6 +309,27 @@ for left in lefts:
         except LookupError:
             recover(left, right)
 """,
+            "materialized comparison results": """
+matrix = [
+    left.id == right.id
+    for left in lefts
+    for right in rights
+]
+""",
+            "next comparison result": """
+first = next(
+    left.id == right.id
+    for left in lefts
+    for right in rights
+)
+""",
+            "ordered before guard": """
+for left in lefts:
+    for right in rights:
+        normalized = sorted(left.values)
+        if left.id == right.id:
+            remember(normalized, right)
+""",
         }
         for label, code in cases.items():
             with self.subTest(label):
@@ -320,7 +354,7 @@ for item in items:
         self.assertIn("Counter", findings[1]["message"])
         self.assertIn("value-to-index dict", findings[2]["message"])
 
-    def test_detect_list_grown_in_loop(self):
+    def test_detect_dynamic_list_growth(self):
         cases = {
             "append": """
 seen = []
@@ -335,6 +369,13 @@ for item in items:
     if item in seen:
         emit(item)
     seen += [item]
+""",
+            "dynamic extend": """
+seen = []
+seen.extend(source)
+for item in items:
+    if item in seen:
+        emit(item)
 """,
         }
         for label, code in cases.items():
@@ -381,6 +422,63 @@ def unique(items, seen: list[str]):
         findings = self._analyze(code)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_detect_local_list_alias_scan(self):
+        code = """
+values = list(source)
+aliases = values
+for item in items:
+    if item in aliases:
+        emit(item)
+"""
+        findings = self._analyze(code)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["name"], "list_membership")
+
+    def test_ignore_bounded_and_non_list_containers(self):
+        cases = {
+            "bounded appends": """
+candidates = []
+if primary:
+    candidates.append(primary)
+if fallback:
+    candidates.insert(0, fallback)
+for item in items:
+    if item in candidates:
+        emit(item)
+""",
+            "variadic positional parameter": """
+def match(items, *known: list[str]):
+    for item in items:
+        if item in known:
+            emit(item)
+""",
+            "variadic keyword parameter": """
+def match(items, **known: list[str]):
+    for item in items:
+        if item in known:
+            emit(item)
+""",
+            "for else": """
+values = list(source)
+for item in items:
+    consume(item)
+else:
+    if final in values:
+        emit(final)
+""",
+            "while else": """
+values = list(source)
+while pending:
+    consume(pending.pop())
+else:
+    if final in values:
+        emit(final)
+""",
+        }
+        for label, code in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._analyze(code), [])
 
     def test_ignore_fixed_lookup_tables_and_remove(self):
         code = """
