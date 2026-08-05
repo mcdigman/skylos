@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from skylos.rules.base import SkylosRule
 
@@ -27,28 +27,40 @@ class _LoopContext(NamedTuple):
     body: list[ast.stmt] | None
 
 
+def _call_func_name(node):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id
+    return None
+
+
+def _method_call_parts(node):
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+    ):
+        return node.func.value.id, node.func.attr
+    return None
+
+
 def _is_small_literal_iterable(node):
     if isinstance(node, ast.Dict):
         return len(node.keys) <= 8
     if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
         return len(node.elts) <= 8
     return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"list", "set", "tuple"}
+        _call_func_name(node) in {"list", "set", "tuple"}
         and len(node.args) == 1
         and not node.keywords
         and _is_small_literal_iterable(node.args[0])
     )
 
-def _is_node_func_list(node):
-    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "list"
 
 def _is_local_list(node):
     if isinstance(node, ast.List):
         return not _is_small_literal_iterable(node)
     return isinstance(node, ast.ListComp) or (
-        _is_node_func_list(node)
+        _call_func_name(node) == "list"
         and bool(node.args)
         and (
             len(node.args) != 1
@@ -58,17 +70,10 @@ def _is_local_list(node):
 
 
 def _is_list_extension(node):
-    return isinstance(node, (ast.List, ast.ListComp)) or _is_node_func_list(node)
+    return isinstance(node, (ast.List, ast.ListComp)) or _call_func_name(node) == "list"
 
 
-def _grown_list_name(node):
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.attr in {"append", "extend", "insert"}
-    ):
-        return node.func.value.id
+def _list_augassign_target(node):
     if (
         isinstance(node, ast.AugAssign)
         and isinstance(node.op, ast.Add)
@@ -77,6 +82,13 @@ def _grown_list_name(node):
     ):
         return node.target.id
     return None
+
+
+def _grown_list_name(node):
+    parts = _method_call_parts(node)
+    if parts is not None and parts[1] in {"append", "extend", "insert"}:
+        return parts[0]
+    return _list_augassign_target(node)
 
 
 def _grown_lists(body):
@@ -122,6 +134,18 @@ def _wrapped_guard_siblings(node, body):
     return None
 
 
+def _has_substantive_work(body):
+    return any(
+        not isinstance(statement, (ast.Continue, ast.Pass)) for statement in body
+    )
+
+
+def _only_continues(body):
+    return not _has_substantive_work(body) and any(
+        isinstance(statement, ast.Continue) for statement in body
+    )
+
+
 def _list_parameters(node):
     parameters = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
     return {
@@ -159,10 +183,7 @@ class _P403Collector(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Lambda(self, node):
-        saved = self.bindings, self.loops, self.local_lists
-        self.bindings, self.loops, self.local_lists = {}, [], set()
-        self.visit(node.body)
-        self.bindings, self.loops, self.local_lists = saved
+        self._visit_scope([node.body])
 
     def _origin(self, node):
         if isinstance(node, ast.Name):
@@ -207,7 +228,7 @@ class _P403Collector(ast.NodeVisitor):
     def _track_assignment(self, target, value):
         if not isinstance(target, ast.Name):
             return
-        if _is_local_list(value) or isinstance(value, ast.Name) and value.id in self.local_lists:
+        if _is_local_list(value) or (isinstance(value, ast.Name) and value.id in self.local_lists):
             self.local_lists.add(target.id)
         else:
             self.local_lists.discard(target.id)
@@ -230,26 +251,22 @@ class _P403Collector(ast.NodeVisitor):
         self.visit(node.value)
         self._track_assignment(node.target, node.value)
 
-    def _loops_fixed(self):
+    def _in_unbounded_loop(self):
         return any(not loop.fixed for loop in self.loops)
 
     def visit_AugAssign(self, node):
         self.generic_visit(node)
-        if not (
-            isinstance(node.op, ast.Add)
-            and isinstance(node.target, ast.Name)
-            and _is_list_extension(node.value)
-        ):
+        name = _list_augassign_target(node)
+        if name is None:
             return
-        if _is_local_list(node.value) or self._loops_fixed():
-            self.local_lists.add(node.target.id)
-
+        if _is_local_list(node.value) or self._in_unbounded_loop():
+            self.local_lists.add(name)
 
     def _push_loop(self, node, target, iterable, body):
         old_bindings = self.bindings.copy()
         flattening = self._origin(iterable) is not None
         self.loops.append(_LoopContext(node, _is_small_literal_iterable(iterable), flattening, body))
-        if body is not None and self._loops_fixed():
+        if body is not None and self._in_unbounded_loop():
             self.local_lists.update(_grown_lists(body))
         level = len(self.loops) - 1
         for child in ast.walk(target):
@@ -370,18 +387,6 @@ class _P403Collector(ast.NodeVisitor):
             and self._is_alias_expression(node.value)
         )
 
-    @staticmethod
-    def _has_substantive_work(body):
-        return any(
-            not isinstance(statement, (ast.Continue, ast.Pass)) for statement in body
-        )
-
-    @staticmethod
-    def _only_continues(body):
-        return all(
-            isinstance(statement, (ast.Continue, ast.Pass)) for statement in body
-        ) and any(isinstance(statement, ast.Continue) for statement in body)
-
     def _finding(self, name, simple_name, message, node):
         return {
             "rule_id": "SKY-P403",
@@ -422,8 +427,8 @@ class _P403Collector(ast.NodeVisitor):
         comparison = self._matching_comparison(node.test, ast.Eq)
         valid = (
             comparison is not None
-            and self._has_substantive_work(node.body)
-            and not self._has_substantive_work(node.orelse)
+            and _has_substantive_work(node.body)
+            and not _has_substantive_work(node.orelse)
             and self._only_aliases(before)
             and self._only_aliases(after)
         )
@@ -433,10 +438,10 @@ class _P403Collector(ast.NodeVisitor):
         comparison = self._matching_comparison(node.test, ast.NotEq, allow_and=False)
         valid = (
             comparison is not None
-            and self._only_continues(node.body)
+            and _only_continues(node.body)
             and not node.orelse
             and self._only_aliases(before)
-            and self._has_substantive_work(after)
+            and _has_substantive_work(after)
         )
         return comparison if valid else None
 
@@ -455,6 +460,13 @@ class _P403Collector(ast.NodeVisitor):
                 self._add_join_finding(loop.node)
         self.generic_visit(node)
 
+    def _check_join_condition(self, node):
+        if len(self.loops) < 2:
+            return
+        comparison = self._matching_comparison(node, ast.Eq)
+        if comparison is not None and self._is_join_comparison(comparison):
+            self._add_join_finding(node)
+
     def _visit_comprehension(self, generators, result_nodes, *, selective_result = False):
         old_bindings = self.bindings.copy()
         pushed = 0
@@ -463,16 +475,11 @@ class _P403Collector(ast.NodeVisitor):
             self._push_loop(generator, generator.target, generator.iter, None)
             pushed += 1
             for condition in generator.ifs:
-                if len(self.loops) >= 2:
-                    comparison = self._matching_comparison(condition, ast.Eq)
-                    if comparison is not None and self._is_join_comparison(comparison):
-                        self._add_join_finding(condition)
+                self._check_join_condition(condition)
                 self.visit(condition)
         for result_node in result_nodes:
-            if selective_result and len(self.loops) >= 2:
-                comparison = self._matching_comparison(result_node, ast.Eq)
-                if comparison is not None and self._is_join_comparison(comparison):
-                    self._add_join_finding(result_node)
+            if selective_result:
+                self._check_join_condition(result_node)
             self.visit(result_node)
         for _ in range(pushed):
             self.loops.pop()
@@ -495,32 +502,31 @@ class _P403Collector(ast.NodeVisitor):
         )
 
     def _add_scan_finding(self, name, operation, node):
+        if name not in self.local_lists or any(loop.fixed for loop in self.loops):
+            return
         messages = {
             "membership": f"Membership checks repeatedly scan locally built list '{name}'. Use a set when duplicates are irrelevant, or maintain counts with collections.Counter.",
             "count": f"'{name}.count(...)' repeatedly scans a locally built list. Maintain counts in a dict or collections.Counter.",
             "index": f"'{name}.index(...)' repeatedly scans a locally built list. Build a value-to-index dict before the loop.",
         }
-        finding = self._finding(
-            f"list_{operation}", operation, messages[operation], node
+        self.findings.append(
+            self._finding(f"list_{operation}", operation, messages[operation], node)
         )
-        if name in self.local_lists and not any(loop.fixed for loop in self.loops):
-            self.findings.append(finding)
 
     def visit_Call(self, node):
         selective_generator = (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "any"
+            _call_func_name(node) == "any"
             and len(node.args) == 1
             and isinstance(node.args[0], ast.GeneratorExp)
         )
         if selective_generator:
             self.selective_generators.add(id(node.args[0]))
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            name = node.func.value.id
-            operation = node.func.attr
+        parts = _method_call_parts(node)
+        if parts is not None:
+            name, operation = parts
             if operation == "extend" and node.args and not _is_small_literal_iterable(node.args[0]):
                 self.local_lists.add(name)
-            elif self.loops and operation in {"append", "insert"} and self._loops_fixed():
+            elif self.loops and operation in {"append", "insert"} and self._in_unbounded_loop():
                 self.local_lists.add(name)
             if self.loops and operation in {"count", "index"}:
                 self._add_scan_finding(name, operation, node)
