@@ -50,7 +50,7 @@ jobs:
             --old "${{ github.event.pull_request.base.sha }}" \
             --new "${{ github.event.pull_request.head.sha }}" \
             --all \
-            --corpus ./_liveness_primer/corpus.toml \
+            --corpus ./_liveness_primer/corpus.yaml \
             --output github \
             --json-out liveness-primer-report.json \
             --jobs 2 \
