@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LIVENESS_PRIMER_REF: static-report-explorer-v2
+  LIVENESS_PRIMER_REF: phase1-core
   PYTHON_VERSION: "3.13"
 
 permissions:
