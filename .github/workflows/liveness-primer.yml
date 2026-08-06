@@ -2,7 +2,6 @@ name: Liveness Primer
 
 on:
   pull_request:
-  workflow_dispatch:
 
 concurrency:
   group: liveness-primer-${{ github.event.pull_request.number }}
