@@ -9,6 +9,15 @@ name: Liveness Primer Comment
 # untrusted text: the PR number is reduced to digits before use, and the
 # report body is only ever moved by file, never interpolated into a script.
 on:
+  # SKY-D290 flags this trigger because it is the usual way a privileged job
+  # ends up running attacker-influenced code. That shape is absent here: this
+  # job checks out nothing, executes no repository or pull request code, reads
+  # a single artifact strictly as data, and binds the comment target to the
+  # measured head SHA before writing. Its only elevated grant is
+  # pull-requests: write. Moving the comment into the measuring workflow --
+  # the obvious way to drop this trigger -- is strictly worse, because that
+  # job does execute the pull request's detector code.
+  # skylos: ignore[SKY-D290] privileged job never executes PR-controlled code
   workflow_run:
     workflows: ["Liveness Primer"]
     types: [completed]
@@ -39,8 +48,30 @@ jobs:
       # decoration: reporting contract §3 requires that a non-comparable or
       # unisolated run never reads as routine, and those signals live above
       # the Totals heading.
+      # The pull request number arrives inside an artifact built by a job that
+      # ran the pull request's own code, so on its own it is a claim, not a
+      # fact: a hostile branch could name someone else's pull request and have
+      # its report posted there. Reducing it to digits stops injection but not
+      # misdirection, so the claim is only honoured when that pull request's
+      # head really is the commit this run measured.
+      - name: Bind the comment target to the measured commit
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          number=$(tr -dc '0-9' < report/pr-number.txt | head -c 10)
+          test -n "$number"
+          claimed=$(gh api "repos/$REPO/pulls/$number" --jq '.head.sha')
+          if [ "$claimed" != "$HEAD_SHA" ]; then
+            echo "PR #$number head is $claimed, but this run measured $HEAD_SHA" >&2
+            exit 1
+          fi
+          echo "pr=$number" >> "$GITHUB_OUTPUT"
+
       - name: Extract the rollup summary
-        id: extract
         env:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -48,10 +79,6 @@ jobs:
           set -euo pipefail
           report=report/liveness-primer-report.md
           test -f "$report"
-
-          number=$(tr -dc '0-9' < report/pr-number.txt | head -c 10)
-          test -n "$number"
-          echo "pr=$number" >> "$GITHUB_OUTPUT"
 
           {
             echo '<!-- liveness-primer-summary -->'
@@ -83,7 +110,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ steps.extract.outputs.pr }}
+          PR: ${{ steps.target.outputs.pr }}
         run: |
           set -euo pipefail
           existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
