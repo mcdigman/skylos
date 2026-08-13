@@ -32,10 +32,10 @@ class TestUnusedExceptVar:
         findings = check_code(UnusedExceptVarRule(), code)
         assert len(findings) == 0
 
-    def test_underscore_convention_is_not_flagged(self):
-        code = "try:\n    raise ValueError\nexcept ValueError as _:\n    pass\n"
+    def test_underscore_convention(self):
+        code = "try:\n    pass\nexcept ValueError as _:\n    print('ignored')\n"
         findings = check_code(UnusedExceptVarRule(), code)
-        assert len(findings) == 0
+        assert len(findings) == 1
 
     def test_multiple_except_one_unused(self):
         code = (
