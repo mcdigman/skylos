@@ -3,13 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 
-REPORTABLE_DEAD_CODE_CLASSIFICATIONS = {
-    "dead",
-    "likely_dead",
-    "validated_dead",
-}
-
-
 def _primary_path(path):
     if not isinstance(path, (list, tuple)):
         return path
@@ -51,69 +44,12 @@ def dead_code_evidence(analyzer, path, pyproject_entrypoint_qnames, threshold=No
 def _evidence_by_name(dead_code_evidence_payload):
     by_name = {}
     for entry in dead_code_evidence_payload.get("symbols", []):
-        by_name.setdefault(entry["qualified_name"], []).append(entry)
+        by_name[entry["qualified_name"]] = entry
     return by_name
 
 
-def _evidence_for_definition(evidence_by_name, definition):
-    candidates = evidence_by_name.get(getattr(definition, "name", ""), [])
-    if not candidates:
-        return None
-
-    definition_file = _normalized_file(getattr(definition, "filename", ""))
-    file_matches = [
-        entry
-        for entry in candidates
-        if _files_identify_same_source(entry.get("file"), definition_file)
-    ]
-    definition_line = getattr(definition, "line", 0) or 0
-    definition_kind = str(getattr(definition, "type", ""))
-
-    if len(candidates) == 1:
-        entry = candidates[0]
-        if entry.get("file") and not file_matches:
-            return None
-        if entry.get("kind") and str(entry["kind"]) != definition_kind:
-            return None
-        if (
-            entry.get("line")
-            and definition_line
-            and entry["line"] != definition_line
-        ):
-            return None
-        return entry
-
-    narrowed = file_matches
-    if not narrowed:
-        return None
-    exact_matches = [
-        entry
-        for entry in narrowed
-        if (entry.get("line", 0) or 0) == definition_line
-        and str(entry.get("kind", "")) == definition_kind
-    ]
-    if len(exact_matches) == 1:
-        return exact_matches[0]
-    return None
-
-
-def _normalized_file(value):
-    return Path(str(value or "")).as_posix().removeprefix("./")
-
-
-def _files_identify_same_source(entry_file, definition_file):
-    entry_path = _normalized_file(entry_file)
-    if not entry_path or not definition_file:
-        return False
-    if entry_path == definition_file:
-        return True
-    if not Path(entry_path).is_absolute():
-        return definition_file.endswith(f"/{entry_path}")
-    return False
-
-
 def _attach_evidence(target: dict, definition, evidence_by_name) -> None:
-    entry = _evidence_for_definition(evidence_by_name, definition)
+    entry = evidence_by_name.get(getattr(definition, "name", ""))
     if not entry:
         return
     target["dead_code_classification"] = entry["classification"]
@@ -125,26 +61,6 @@ def _attach_evidence(target: dict, definition, evidence_by_name) -> None:
         target["dead_code_reason_tags"] = list(decision.get("reason_tags") or [])
 
 
-def _candidate_disposition(definition, thr, evidence_by_name):
-    if not _is_dead_definition(definition, thr):
-        return None
-
-    entry = _evidence_for_definition(evidence_by_name, definition)
-    if not isinstance(entry, dict):
-        return "reported"
-
-    classification = str(entry.get("classification") or "")
-    if classification == "alive":
-        return "rescued"
-    if classification == "uncertain":
-        return "abstained"
-    if classification in REPORTABLE_DEAD_CODE_CLASSIFICATIONS:
-        return "reported"
-
-    # Unknown evidence states must not become destructive dead-code findings.
-    return "abstained"
-
-
 def _is_dead_definition(definition, thr):
     if definition.references != 0:
         return False
@@ -153,6 +69,16 @@ def _is_dead_definition(definition, thr):
     if definition.confidence <= 0:
         return False
     return definition.confidence >= thr
+
+
+def _dead_class_keys(analyzer, thr):
+    keys = set()
+    for key, definition in analyzer.defs.items():
+        if definition.type not in ("class", "type"):
+            continue
+        if _is_dead_definition(definition, thr):
+            keys.add(key)
+    return keys
 
 
 def _class_key_by_name_file(analyzer):
@@ -176,51 +102,20 @@ def _method_owner_key(definition, class_keys):
 
 
 def unused_definitions(analyzer, thr, dead_code_evidence_payload):
-    reported, _, _ = dead_code_candidate_decisions(
-        analyzer,
-        thr,
-        dead_code_evidence_payload,
-    )
-    return reported
-
-
-def dead_code_candidate_decisions(analyzer, thr, dead_code_evidence_payload):
     evidence_by_name = _evidence_by_name(dead_code_evidence_payload)
-    dispositions = {}
-    for key, definition in analyzer.defs.items():
-        dispositions[key] = _candidate_disposition(
-            definition,
-            thr,
-            evidence_by_name,
-        )
-
-    reported = []
-    rescued = []
-    abstained = []
-    reported_classes = {
-        key
-        for key, definition in analyzer.defs.items()
-        if definition.type in ("class", "type")
-        and dispositions.get(key) == "reported"
-    }
+    unused = []
+    dead_classes = _dead_class_keys(analyzer, thr)
     class_keys = _class_key_by_name_file(analyzer)
-    for key, definition in analyzer.defs.items():
-        disposition = dispositions.get(key)
-        if disposition is None:
+    for definition in analyzer.defs.values():
+        if not _is_dead_definition(definition, thr):
             continue
         owner_key = _method_owner_key(definition, class_keys)
-        if disposition == "reported" and owner_key in reported_classes:
+        if owner_key in dead_classes:
             continue
         item = definition.to_dict()
         _attach_evidence(item, definition, evidence_by_name)
-        item["dead_code_disposition"] = disposition
-        if disposition == "reported":
-            reported.append(item)
-        elif disposition == "rescued":
-            rescued.append(item)
-        else:
-            abstained.append(item)
-    return reported, rescued, abstained
+        unused.append(item)
+    return unused
 
 
 def _definition_loc(definition):

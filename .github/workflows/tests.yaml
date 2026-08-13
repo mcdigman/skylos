@@ -1,0 +1,95 @@
+name: Tests + Coverage
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test_matrix:
+    name: test-matrix (${{ matrix.install_target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        install_target:
+          - "."
+          - ".[llm]"
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.22"
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+
+      - name: Build repo Go engine
+        run: |
+          mkdir -p /tmp/skylos-go-build /tmp/skylos-go-gopath
+          cd skylos/engines/go
+          GOCACHE=/tmp/skylos-go-build GOPATH=/tmp/skylos-go-gopath go build -o skylos-go ./cmd/skylos-go
+
+      - name: Create venv + install deps
+        run: |
+          uv venv
+          uv pip install -e "${{ matrix.install_target }}"
+          uv pip install pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: |
+          uv run pytest -q --cov=skylos --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: false
+          flags: ${{ matrix.install_target == '.[llm]' && 'llm-extra' || 'default-install' }}
+
+  docker_smoke:
+    name: docker-smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build -t skylos:test .
+
+      - name: Check CLI version
+        run: docker run --rm skylos:test --version
+
+      - name: Run fixture scan
+        run: |
+          docker run --rm \
+            -v "$PWD/benchmarks/quality/fixtures/argument_overload:/work" \
+            -w /work \
+            skylos:test \
+            . --json --no-provenance > /tmp/skylos-docker-smoke.json
+          grep -q '"unused_functions"' /tmp/skylos-docker-smoke.json
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: [test_matrix, docker_smoke]
+    if: ${{ always() }}
+
+    steps:
+      - name: Require matrix success
+        run: |
+          if [ "${{ needs.test_matrix.result }}" != "success" ] || [ "${{ needs.docker_smoke.result }}" != "success" ]; then
+            echo "test_matrix result: ${{ needs.test_matrix.result }}"
+            echo "docker_smoke result: ${{ needs.docker_smoke.result }}"
+            exit 1
+          fi

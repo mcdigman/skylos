@@ -1,5 +1,3 @@
-ARG PYTHON_VERSION=3.14
-
 FROM golang:1.22 AS go-build
 
 WORKDIR /src/skylos/engines/go
@@ -10,7 +8,7 @@ COPY skylos/engines/go/internal ./internal
 
 RUN go build -o /out/skylos-go ./cmd/skylos-go
 
-FROM python:${PYTHON_VERSION}-slim AS build
+FROM python:3.12-slim AS build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -30,17 +28,12 @@ RUN python -m pip install --upgrade pip build && \
     python -m build --wheel --outdir /dist && \
     python -m pip wheel --wheel-dir /wheelhouse /dist/*.whl
 
-FROM python:${PYTHON_VERSION}-slim
-
-ARG PYTHON_VERSION
+FROM python:3.12-slim
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    SKYLOS_CONTAINER_PYTHON_VERSION=${PYTHON_VERSION}
-
-LABEL org.opencontainers.image.python.version=${PYTHON_VERSION}
+    PYTHONUNBUFFERED=1
 
 WORKDIR /work
 
