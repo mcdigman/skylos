@@ -64,7 +64,7 @@ def test_pretty_renderer_uses_secret_preview_instead_of_source_line(tmp_path):
     assert "sk_live_real_secret_value" not in output
 
 
-def test_pretty_renderer_prints_compact_dead_code_reason(tmp_path):
+def test_pretty_renderer_prints_classification_and_evidence_source(tmp_path):
     source = tmp_path / "src" / "app.py"
     result = {
         "analysis_summary": {"total_files": 1},
@@ -73,12 +73,16 @@ def test_pretty_renderer_prints_compact_dead_code_reason(tmp_path):
                 "name": "old_helper",
                 "file": str(source),
                 "line": 1,
-                "dead_code_reason_tags": [
-                    "uncertainty",
-                    "no_refs",
-                    "not_exported",
-                    "no_entrypoint",
-                    "confidence_ge_threshold",
+                "dead_code_classification": "likely_dead",
+                "dead_code_evidence": [
+                    {
+                        "kind": "no_static_references",
+                        "role": "supports_dead",
+                        "reason": "no static references were found",
+                        "source": "analyzer",
+                        "confidence": 1.0,
+                        "details": {"references": 0},
+                    }
                 ],
             }
         ],
@@ -89,7 +93,53 @@ def test_pretty_renderer_prints_compact_dead_code_reason(tmp_path):
     output = console.export_text()
 
     assert "Unused function: old_helper" in output
-    assert "why: uncertain · no refs · not exported" in output
+    assert "evidence: likely dead — no static references were found [analyzer]" in output
+
+
+def test_pretty_renderer_shows_rescued_and_abstained_counts():
+    result = {
+        "analysis_summary": {
+            "total_files": 1,
+            "dead_code_evidence": {
+                "candidate_decisions": {
+                    "reported": 0,
+                    "rescued": 2,
+                    "abstained": 1,
+                }
+            },
+        }
+    }
+
+    console = _recording_console()
+    render_pretty_results(console, result)
+    output = console.export_text()
+
+    assert "dead-code rescued: 2" in output
+    assert "dead-code abstained: 1" in output
+
+
+def test_pretty_renderer_shows_incomplete_analysis_as_an_error(tmp_path):
+    result = {
+        "analysis_summary": {"total_files": 1, "analysis_error_count": 1},
+        "analysis_errors": [
+            {
+                "rule_id": "SKY-ANALYSIS-INCOMPLETE",
+                "severity": "HIGH",
+                "message": "invalid syntax",
+                "file": str(tmp_path / "future.py"),
+                "line": 1,
+            }
+        ],
+    }
+
+    console = _recording_console()
+    render_pretty_results(console, result, root_path=tmp_path)
+    output = console.export_text()
+
+    assert "analysis errors: 1" in output
+    assert "SKY-ANALYSIS-INCOMPLETE" in output
+    assert "invalid syntax" in output
+    assert "No findings to display" not in output
 
 
 def test_pretty_renderer_sanitizes_control_chars_from_finding_fields(tmp_path):

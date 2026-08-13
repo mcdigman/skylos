@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import traceback
+import warnings
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -2094,6 +2095,7 @@ class Skylos:
         pyproject_entrypoint_qnames=None,
         pyproject_entrypoint_modules=None,
         config_file=None,
+        analysis_errors=None,
     ):
         from skylos.reporting.result_builder import build_analysis_result
 
@@ -2125,6 +2127,7 @@ class Skylos:
             pyproject_entrypoint_qnames=pyproject_entrypoint_qnames,
             pyproject_entrypoint_modules=pyproject_entrypoint_modules,
             config_file=config_file,
+            analysis_errors=analysis_errors,
         )
 
     def analyze(
@@ -2213,9 +2216,11 @@ class Skylos:
                 "unused_variables": [],
                 "unused_parameters": [],
                 "unused_files": [],
+                "analysis_errors": [],
                 "analysis_summary": {
                     "total_files": 0,
                     "excluded_folders": exclude_folders if exclude_folders else [],
+                    "analysis_error_count": 0,
                     "monorepo_detected": workspace_inventory.is_monorepo,
                     "workspace_count": len(workspace_inventory.packages),
                     "workspace_total_packages": workspace_inventory.total_packages,
@@ -2352,6 +2357,7 @@ class Skylos:
         all_quality = []
         all_ai_defects = []
         all_suppressed = []
+        analysis_errors = []
         empty_files = []
         file_contexts = []
         all_clone_fragments = []
@@ -2419,6 +2425,13 @@ class Skylos:
 
             for file, out in zip(files, outs):
                 if out is None:
+                    analysis_errors.append(
+                        _analysis_error_payload(
+                            file,
+                            RuntimeError("Static analysis worker returned no result"),
+                            kind="worker_error",
+                        )
+                    )
                     continue
 
                 mod = modmap[file]
@@ -2447,6 +2460,9 @@ class Skylos:
                 file_clone_fragments = out[22] if len(out) > 22 else []
                 file_architecture_metrics = out[23] if len(out) > 23 else None
                 file_top_level_refs = out[24] if len(out) > 24 else set()
+                file_analysis_error = out[25] if len(out) > 25 else None
+                if isinstance(file_analysis_error, dict):
+                    analysis_errors.append(file_analysis_error)
                 (
                     defs,
                     refs,
@@ -3666,6 +3682,7 @@ class Skylos:
             pyproject_entrypoint_qnames=pyproject_entrypoint_qnames,
             pyproject_entrypoint_modules=pyproject_entrypoint_modules,
             config_file=config_file,
+            analysis_errors=analysis_errors,
         )
 
         return json.dumps(result, indent=2)
@@ -3687,6 +3704,46 @@ def _is_truly_empty_or_docstring_only(tree):
         and isinstance(only.value, ast.Constant)
         and isinstance(only.value.value, str)
     )
+
+
+def _analysis_error_payload(file, error, *, kind=None):
+    is_syntax_error = isinstance(error, SyntaxError)
+    message = getattr(error, "msg", None) if is_syntax_error else None
+    message = str(message or error or type(error).__name__)
+    message = " ".join(message.splitlines())[:500]
+
+    line = getattr(error, "lineno", None) or 1
+    column = getattr(error, "offset", None) or 1
+    try:
+        line = max(1, int(line))
+    except (TypeError, ValueError):
+        line = 1
+    try:
+        column = max(1, int(column))
+    except (TypeError, ValueError):
+        column = 1
+
+    payload = {
+        "rule_id": "SKY-ANALYSIS-INCOMPLETE",
+        "severity": "HIGH",
+        "kind": kind or ("syntax_error" if is_syntax_error else "processing_error"),
+        "error_type": type(error).__name__,
+        "message": message,
+        "file": str(file),
+        "line": line,
+        "column": column,
+        "python_version": (
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        ),
+    }
+    if is_syntax_error:
+        payload["suggestion"] = (
+            "Fix the reported syntax, or use a Python runtime that supports the "
+            "project's syntax; official container images provide matching "
+            "-pythonX.Y tags."
+        )
+    return payload
 
 
 def proc_file(
@@ -3722,7 +3779,13 @@ def proc_file(
         ignore_lines = get_skylos_ignore_lines(source)
         noqa_codes_by_line = get_noqa_codes_by_line(source)
 
-        tree = ast.parse(source)
+        tree = ast.parse(source, filename=str(file))
+        # ast.parse() can accept ASTs that Python later rejects, such as
+        # functions with duplicate argument names. Compile without executing
+        # so every compile-time SyntaxError follows the incomplete-analysis path.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            compile(tree, str(file), "exec", dont_inherit=True)
 
         raw_imports = collect_python_raw_imports(tree, file, mod)
 
@@ -3909,6 +3972,7 @@ def proc_file(
             clone_fragments,
             architecture_metrics,
             getattr(v, "top_level_refs", set()),
+            None,
         )
 
     except Exception as e:
@@ -3944,6 +4008,7 @@ def proc_file(
             [],
             None,
             set(),
+            _analysis_error_payload(file, e),
         )
 
 
