@@ -1,14 +1,27 @@
 name: Liveness Primer
 
+# Measures the blast radius of this PR's Skylos changes across the
+# liveness_primer corpus. This job runs the PR's own detector code, so it
+# holds no write token and never comments: it only uploads the report.
+# Liveness Primer Comment consumes that artifact from the default branch.
 on:
   pull_request:
+    # Deliberately omits `synchronize`. A corpus run is expensive, so the
+    # blast radius is measured once, against the commit the PR opened with.
+    # Use the Actions "Run workflow" button to re-measure a moved head.
+    types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to re-measure
+        required: true
 
 concurrency:
-  group: liveness-primer-${{ github.event.pull_request.number }}
+  group: liveness-primer-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 env:
-  LIVENESS_PRIMER_REF: phase1-core
+  LIVENESS_PRIMER_REF: main
   PYTHON_VERSION: "3.13"
 
 permissions:
@@ -20,6 +33,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Resolve the pull request under measurement
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          number=$(printf '%s' "$PR_NUMBER" | tr -dc '0-9')
+          test -n "$number"
+          gh api "repos/${{ github.repository }}/pulls/$number" \
+            --jq '"base=" + .base.sha, "head=" + .head.sha' >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$number" > pr-number.txt
+
       - name: Check out liveness_primer
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -39,7 +65,8 @@ jobs:
       # Summary page; writing it to a file alone leaves the job log showing
       # raw markdown and the Summary empty. --json-out archives the
       # CI-consumable JSON product from the same corpus run, so the report
-      # is not paid for twice.
+      # is not paid for twice. The corpus file ships with the package, so
+      # no --corpus override is passed.
       - name: Compare Skylos revisions across the corpus
         run: |
           set -o pipefail
@@ -47,10 +74,9 @@ jobs:
             liveness-primer run \
             --tool skylos \
             --repo "${{ github.server_url }}/${{ github.repository }}" \
-            --old "${{ github.event.pull_request.base.sha }}" \
-            --new "${{ github.event.pull_request.head.sha }}" \
+            --old "${{ steps.pr.outputs.base }}" \
+            --new "${{ steps.pr.outputs.head }}" \
             --all \
-            --corpus ./_liveness_primer/corpus.yaml \
             --output github \
             --json-out liveness-primer-report.json \
             --jobs 2 \
@@ -64,4 +90,5 @@ jobs:
           path: |
             liveness-primer-report.md
             liveness-primer-report.json
+            pr-number.txt
           if-no-files-found: error
