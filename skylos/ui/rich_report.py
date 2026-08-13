@@ -8,6 +8,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
+from skylos.ui.dead_code_evidence import (
+    compact_dead_code_evidence,
+    dead_code_candidate_counts,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +58,73 @@ def _grep_verify_pill(summary):
     return f"[brand]Grep verify: on[/brand] [muted](rescued {rescued_count})[/muted]"
 
 
+def _dead_code_evidence_pill(result):
+    counts = dead_code_candidate_counts(result)
+    rescued = counts.get("rescued", 0)
+    abstained = counts.get("abstained", 0)
+    if not rescued and not abstained:
+        return None
+    return (
+        f"[good]Evidence rescued: {rescued}[/good] "
+        f"[warn]abstained: {abstained}[/warn]"
+    )
+
+
 def _display_cap(items, limit):
     cap = limit or len(items)
     return items[:cap], max(0, len(items) - cap)
+
+
+def _render_analysis_errors(
+    console: Console,
+    result,
+    *,
+    root_path=None,
+    limit=None,
+):
+    errors = [
+        error
+        for error in (result.get("analysis_errors") or [])
+        if isinstance(error, dict)
+    ]
+    if not errors:
+        return
+
+    count = len(errors)
+    console.print(
+        Panel.fit(
+            f"[bad]Analysis incomplete: {count} file(s) could not be analyzed.[/bad]\n"
+            "[muted]No grade or clean result was produced; Skylos exits with code 2.[/muted]",
+            border_style="bad",
+        )
+    )
+
+    table = Table(title="Analysis Errors", expand=True)
+    table.add_column("File", style="bold", overflow="fold")
+    table.add_column("Line", justify="right", width=6)
+    table.add_column("Error", overflow="fold")
+    table.add_column("Runtime", style="muted", width=14)
+
+    visible, overflow = _display_cap(errors, limit)
+    for error in visible:
+        path = escape(_shorten_path(error.get("file"), root_path))
+        line = str(error.get("line") or 1)
+        kind = str(error.get("kind") or error.get("error_type") or "analysis error")
+        message = str(error.get("message") or "File analysis failed")
+        runtime = str(error.get("python_version") or "?")
+        table.add_row(
+            path,
+            line,
+            escape(f"{kind.replace('_', ' ')}: {message}"),
+            escape(f"Python {runtime}"),
+        )
+
+    console.print(table)
+    if overflow:
+        console.print(
+            f"  [muted]... and {overflow} more (use --limit to adjust)[/muted]"
+        )
+    console.print()
 
 
 def _score_style(score):
@@ -159,55 +228,8 @@ def _format_confidence(conf):
     return str(conf)
 
 
-_DEAD_CODE_REASON_LABELS = {
-    "no_refs": "no refs",
-    "not_exported": "not exported",
-    "no_entrypoint": "no entrypoint",
-    "static_reference": "has refs",
-    "reachable_from_root": "root reachable",
-    "top_level_execution": "import-time call",
-    "framework_root": "framework entry",
-    "package_entrypoint": "package entry",
-    "test_entrypoint": "test entry",
-    "dynamic_pattern": "dynamic ref",
-    "coverage_hit": "coverage hit",
-    "trace_hit": "trace hit",
-    "grep_rescue": "grep usage",
-    "uncertainty": "uncertain",
-    "validated_dead": "validated dead",
-    "validation_failed": "live use found",
-    "no_liveness_evidence": "no live evidence",
-}
-
-
 def _dead_code_why(item: dict) -> str:
-    decision = item.get("dead_code_decision") or {}
-    tags = item.get("dead_code_reason_tags")
-    if tags is None and isinstance(decision, dict):
-        tags = decision.get("reason_tags")
-
-    if isinstance(tags, (list, tuple)):
-        visible = []
-        for raw_tag in tags:
-            tag = str(raw_tag)
-            if tag == "confidence_ge_threshold":
-                continue
-            label = _DEAD_CODE_REASON_LABELS.get(tag)
-            if label:
-                visible.append(label)
-        if visible:
-            shown = visible[:3]
-            suffix = ""
-            if len(visible) > len(shown):
-                suffix = f" · +{len(visible) - len(shown)}"
-            return " · ".join(shown) + suffix
-
-    reason = item.get("dead_code_reason")
-    if reason is None and isinstance(decision, dict):
-        reason = decision.get("primary_reason")
-    if not reason:
-        return ""
-    return escape(str(reason))
+    return escape(compact_dead_code_evidence(item))
 
 
 def _render_unused(console: Console, root_path, limit, title, items, name_key="name"):
@@ -223,7 +245,7 @@ def _render_unused(console: Console, root_path, limit, title, items, name_key="n
     table.add_column("Location", style="muted", overflow="fold")
     table.add_column("Conf", style="yellow", width=6, justify="right")
     if has_why:
-        table.add_column("Why", style="muted", width=30, overflow="fold")
+        table.add_column("Evidence", style="muted", width=42, overflow="fold")
 
     show, overflow = _display_cap(items, limit)
     for i, item in enumerate(show, 1):
@@ -245,7 +267,7 @@ def _render_unused(console: Console, root_path, limit, title, items, name_key="n
         "[muted]Name — the unused function, import, class, or variable.[/muted]\n"
         "[muted]Conf — how confident Skylos is that this code is truly unused (higher = safer to remove).[/muted]\n"
         + (
-            "[muted]Why — compact evidence behind the dead-code decision.[/muted]\n"
+            "[muted]Evidence — classification and analyzer evidence behind the dead-code decision.[/muted]\n"
             if has_why
             else ""
         )
@@ -735,11 +757,19 @@ def render_results(
                     bad_style="muted",
                 ),
                 _grep_verify_pill(summ),
+                _dead_code_evidence_pill(result),
             ]
             if part
         )
     )
     console.print()
+
+    _render_analysis_errors(
+        console,
+        result,
+        root_path=root_path,
+        limit=limit,
+    )
 
     grade_data = result.get("grade")
     if grade_data:
