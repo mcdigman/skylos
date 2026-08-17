@@ -588,6 +588,25 @@ def test_apply_display_filters_severity_filters_without_crashing():
     assert filtered["analysis_summary"]["quality_count"] == 2
 
 
+def test_apply_display_filters_preserves_incomplete_grep_status():
+    grep_verify = {
+        "enabled": True,
+        "complete": False,
+        "status": "incomplete",
+        "incomplete_reason": "budget_exhausted",
+    }
+    result = {
+        "analysis_summary": {"total_files": 1, "grep_verify": grep_verify},
+        "analysis_errors": [{"kind": "grep_budget_exhausted"}],
+        "quality": [],
+    }
+
+    filtered = cli._apply_display_filters(result, severity="high")
+
+    assert filtered["analysis_summary"]["grep_verify"] == grep_verify
+    assert filtered["analysis_errors"] == result["analysis_errors"]
+
+
 def test_apply_display_filters_combines_category_file_and_severity():
     result = {
         "analysis_summary": {"total_files": 1},
@@ -749,6 +768,25 @@ def test_apply_rule_selection_filters_exact_ids_and_preserves_analysis_errors():
     assert filtered["danger"] == []
     assert filtered["unused_functions"] == []
     assert filtered["analysis_summary"]["selected_rules"] == ["SKY-L012"]
+
+
+def test_apply_rule_selection_preserves_incomplete_grep_status():
+    grep_verify = {
+        "enabled": True,
+        "complete": False,
+        "status": "incomplete",
+        "incomplete_reason": "budget_exhausted",
+    }
+    result = {
+        "analysis_summary": {"total_files": 1, "grep_verify": grep_verify},
+        "analysis_errors": [{"kind": "grep_budget_exhausted"}],
+        "quality": [{"rule_id": "SKY-Q301", "file": "app.py", "line": 1}],
+    }
+
+    filtered = cli._apply_rule_selection(result, ["SKY-Q301"])
+
+    assert filtered["analysis_summary"]["grep_verify"] == grep_verify
+    assert filtered["analysis_errors"] == result["analysis_errors"]
 
 
 def test_apply_rule_selection_uses_public_ids_for_dead_code_without_rule_ids():
@@ -1330,6 +1368,37 @@ def test_render_results_shows_grep_verify_summary():
     assert "rescued 3" in printed
 
 
+def test_render_results_shows_incomplete_grep_verification():
+    console = Mock()
+    result = {
+        "analysis_summary": {
+            "total_files": 1,
+            "grep_verify": {
+                "enabled": True,
+                "rescued_count": 0,
+                "complete": False,
+                "candidate_count": 12,
+            },
+        },
+        "unused_functions": [],
+        "unused_imports": [],
+        "unused_parameters": [],
+        "unused_variables": [],
+        "unused_classes": [],
+        "quality": [],
+        "danger": [],
+        "secrets": [],
+    }
+
+    cli.render_results(console, result, tree=False, root_path="/root")
+
+    printed = "\n".join(
+        str(call.args[0]) for call in console.print.call_args_list if call.args
+    )
+    assert "Grep verify: incomplete" in printed
+    assert "12 candidates affected" in printed
+
+
 def test_render_results_shows_analysis_errors_without_grade():
     console = Mock()
     result = {
@@ -1341,6 +1410,7 @@ def test_render_results_shows_analysis_errors_without_grade():
                 "file": "/root/future.py",
                 "line": 1,
                 "python_version": "3.12.13",
+                "affected_file_count": 7,
             }
         ],
         "unused_functions": [],
@@ -1367,6 +1437,7 @@ def test_render_results_shows_analysis_errors_without_grade():
         if call.args and isinstance(call.args[0], cli.Panel)
     ]
     assert any("Analysis incomplete" in str(panel.renderable) for panel in panels)
+    assert any("7 affected files" in str(panel.renderable) for panel in panels)
     assert all("Codebase Grade" not in str(panel.renderable) for panel in panels)
 
 
@@ -1580,8 +1651,9 @@ def test_main_sarif_maps_categories_rule_ids_and_lines(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_exporter_ctor(findings, tool_name=None):
+    def fake_exporter_ctor(findings, tool_name=None, *, analyzer_owned=False):
         captured["findings"] = findings
+        captured["analyzer_owned"] = analyzer_owned
         exp = Mock()
         exp.write = Mock()
         exp.generate = Mock(return_value={"runs": [{}]})
@@ -1597,6 +1669,7 @@ def test_main_sarif_maps_categories_rule_ids_and_lines(monkeypatch, tmp_path):
 
     findings = captured.get("findings")
     assert findings, "Expected SARIF exporter to receive findings"
+    assert captured["analyzer_owned"] is True
 
     cats = set()
     for f in findings:
@@ -1678,8 +1751,9 @@ def test_main_sarif_category_reliability_excludes_security_deployment_findings(
 
     captured = {}
 
-    def fake_exporter_ctor(findings, tool_name=None):
+    def fake_exporter_ctor(findings, tool_name=None, *, analyzer_owned=False):
         captured["findings"] = findings
+        captured["analyzer_owned"] = analyzer_owned
         exporter = Mock()
         exporter.generate.return_value = {"runs": [{}]}
         return exporter
@@ -1694,6 +1768,7 @@ def test_main_sarif_category_reliability_excludes_security_deployment_findings(
 
     assert [finding["rule_id"] for finding in captured["findings"]] == ["SKY-DEP003"]
     assert captured["findings"][0]["category"] == "RELIABILITY"
+    assert captured["analyzer_owned"] is True
 
 
 def test_main_json_category_reliability_excludes_security_deployment_findings(
@@ -1855,6 +1930,7 @@ def test_main_json_upload_calls_upload_report_quiet(monkeypatch):
         "is_forced": False,
         "strict": False,
         "quiet": True,
+        "analyzer_owned": True,
     }
     mock_print.assert_called_once()
     printed_payload = json.loads(mock_print.call_args.args[0])

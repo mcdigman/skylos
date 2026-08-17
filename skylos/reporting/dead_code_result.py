@@ -33,7 +33,12 @@ def dead_code_evidence(analyzer, path, pyproject_entrypoint_qnames, threshold=No
         if evidence_root.is_file():
             evidence_root = evidence_root.parent
 
-    from skylos.deadcode.evidence import build_dead_code_evidence
+    from skylos.deadcode.evidence import (
+        EvidenceEvent,
+        EvidenceKind,
+        SymbolKey,
+        build_dead_code_evidence,
+    )
 
     ledger = build_dead_code_evidence(
         analyzer.defs,
@@ -41,6 +46,15 @@ def dead_code_evidence(analyzer, path, pyproject_entrypoint_qnames, threshold=No
         pyproject_entrypoint_qnames=pyproject_entrypoint_qnames,
         threshold=threshold,
     )
+    for finding in getattr(analyzer, "_grep_verify_incomplete_candidates", ()):
+        ledger.add(
+            SymbolKey.from_finding(finding),
+            EvidenceEvent(
+                kind=EvidenceKind.UNCERTAINTY,
+                reason="grep verification did not complete",
+                source="grep_verify",
+            ),
+        )
     return ledger, ledger.to_dict(
         evidence_root,
         definitions=analyzer.defs,
@@ -186,8 +200,12 @@ def unused_definitions(analyzer, thr, dead_code_evidence_payload):
 
 def dead_code_candidate_decisions(analyzer, thr, dead_code_evidence_payload):
     evidence_by_name = _evidence_by_name(dead_code_evidence_payload)
+    scoped_keys = getattr(analyzer, "_dead_code_scope_keys", None)
     dispositions = {}
     for key, definition in analyzer.defs.items():
+        if scoped_keys is not None and key not in scoped_keys:
+            dispositions[key] = None
+            continue
         dispositions[key] = _candidate_disposition(
             definition,
             thr,

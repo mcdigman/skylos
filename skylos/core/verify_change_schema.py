@@ -55,7 +55,10 @@ SUGGESTED_FIX_BY_VIBE = {
     "hallucinated_reference": (
         "Define or import the referenced symbol, or replace it with an existing helper."
     ),
-    "incomplete_generation": "Implement the stub or remove the unfinished code path.",
+    "incomplete_generation": (
+        "Implement the stub, replace or handle placeholder defaults, or remove "
+        "the unfinished code path."
+    ),
     "ghost_config": "Define the referenced config value or remove the stale flag check.",
     "stale_reference": "Update the reference to the renamed symbol or remove it.",
     "missing_resilience_control": "Add the missing timeout or resilience control.",
@@ -120,6 +123,7 @@ def build_verify_change_response(
     scan_target: str | Path | None = None,
     contract: Any | None = None,
     include_security_findings: bool = False,
+    analyzer_owned: bool = False,
 ) -> dict[str, Any]:
     root = _project_root(project_root)
     parsed_range = _coerce_line_range(line_range)
@@ -134,7 +138,13 @@ def build_verify_change_response(
         if not _matches_line_range(finding, parsed_range):
             continue
 
-        normalized = _normalize_finding(finding, category, root, contract=contract)
+        normalized = _normalize_finding(
+            finding,
+            category,
+            root,
+            contract=contract,
+            analyzer_owned=analyzer_owned,
+        )
         findings.append(normalized)
 
     findings.sort(
@@ -205,6 +215,7 @@ def _normalize_finding(
     root: Path,
     *,
     contract: Any | None = None,
+    analyzer_owned: bool = False,
 ) -> dict[str, Any]:
     rule_id = str(_finding_value(finding, ("rule_id", "rule"), "UNKNOWN"))
     default_vibe, default_likelihood = _rule_defaults(rule_id)
@@ -227,7 +238,10 @@ def _normalize_finding(
     metadata = finding.get("metadata")
     if isinstance(metadata, dict):
         normalized["metadata"] = dict(metadata)
-    evidence_contract = finding_evidence_contract(finding)
+    evidence_contract = finding_evidence_contract(
+        finding,
+        analyzer_owned=analyzer_owned,
+    )
     if evidence_contract is not None:
         normalized["evidence_contract"] = evidence_contract
     normalized.update(contract_finding_metadata(contract, finding))

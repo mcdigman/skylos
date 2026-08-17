@@ -77,7 +77,7 @@ _RULES = (
     RuleCatalogEntry("SKY-L021", "Security regression", "quality"),
     RuleCatalogEntry("SKY-L023", "Phantom decorator", "ai_defect"),
     RuleCatalogEntry("SKY-L024", "Stale mock", "quality"),
-    RuleCatalogEntry("SKY-L026", "Unfinished generated code", "quality"),
+    RuleCatalogEntry("SKY-L026", "Unfinished code or placeholder default", "quality"),
     RuleCatalogEntry("SKY-L027", "Duplicate string literal", "quality"),
     RuleCatalogEntry("SKY-L028", "Too many returns", "quality"),
     RuleCatalogEntry("SKY-L029", "Boolean trap", "quality"),
@@ -261,6 +261,15 @@ _RULES = (
     RuleCatalogEntry("SKY-D270", "Sensitive data in storage", "security", "MEDIUM"),
     RuleCatalogEntry(
         "SKY-D271", "Error information disclosure over HTTP", "security", "MEDIUM"
+    ),
+    RuleCatalogEntry(
+        "SKY-D280",
+        "Next.js mutating API route missing authentication",
+        "security",
+        "HIGH",
+    ),
+    RuleCatalogEntry(
+        "SKY-D281", "Next.js server action SQL injection", "security", "CRITICAL"
     ),
     RuleCatalogEntry(
         "SKY-D282", "Webhook signature verification issue", "security", "HIGH"
@@ -526,7 +535,7 @@ _RULES = (
     RuleCatalogEntry("SKY-G260", "Go unclosed resource", "security", "HIGH"),
     RuleCatalogEntry("SKY-G280", "Go weak TLS version", "security", "HIGH"),
     RuleCatalogEntry("SKY-S101", "Secret detected", "secrets", "CRITICAL"),
-    RuleCatalogEntry("SKY-S102", "High-entropy generic secret", "secrets", "HIGH"),
+    RuleCatalogEntry("SKY-S102", "Client-side secret exposure", "secrets", "HIGH"),
     RuleCatalogEntry("SKY-SC001", "Smart contract security issue", "security", "HIGH"),
 )
 
