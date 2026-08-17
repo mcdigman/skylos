@@ -24,6 +24,21 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      # Liveness Primer Comment needs to know which pull request this report
+      # belongs to, and workflow_run does not carry that number. The value is
+      # only a claim once it leaves this job -- the artifact is built by a job
+      # that runs the pull request's own code -- so that workflow re-checks it
+      # against the head commit this run measured before posting anywhere.
+      - name: Record the pull request under measurement
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          number=$(printf '%s' "$PR_NUMBER" | tr -dc '0-9')
+          test -n "$number"
+          printf '%s\n' "$number" > pr-number.txt
+
       - name: Check out pinned liveness_primer
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -41,7 +56,9 @@ jobs:
 
       - name: Compare base with the pull request merge result
         env:
-          SKYLOS_REPOSITORY: https://github.com/duriantaco/skylos
+          # Measure the repository the pull request actually lives in. Pinning
+          # this to upstream would look for fork commits that do not exist there.
+          SKYLOS_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # The base repository owns this synthetic merge commit, including
           # for fork PRs, so the comparison tests what would actually land.
@@ -81,5 +98,6 @@ jobs:
           path: |
             liveness-primer-report.md
             liveness-primer-report.json
+            pr-number.txt
           if-no-files-found: error
           retention-days: 14

@@ -19,7 +19,7 @@ on:
   # job does execute the pull request's detector code.
   # skylos: ignore[SKY-D290] privileged job never executes PR-controlled code
   workflow_run:
-    workflows: ["Liveness Primer"]
+    workflows: ["Analyzer Blast Radius"]
     types: [completed]
 
 permissions:
@@ -93,8 +93,9 @@ jobs:
             echo
             awk '/^## Totals$/{f=1;next} f&&/^## /{exit} f' "$report" | grep -v '^legend:'
             echo
-            echo "<sub>Measured when the pull request was opened; later commits are not"
-            echo "reflected. <a href=\"$RUN_URL\">Full report and JSON artifact</a>.</sub>"
+            echo "<sub>Measured on the merge of this head into the base branch, and"
+            echo "re-measured on every push. <a href=\"$RUN_URL\">Full report and JSON"
+            echo "artifact</a>.</sub>"
           } > comment.md
 
           # A comment that trips the API limit is worse than a trimmed one.

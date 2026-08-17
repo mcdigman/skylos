@@ -6,10 +6,15 @@ from skylos.rules.config.cicd.github_actions import scan_github_actions_file
 
 
 WORKFLOW_PATH = Path(".github/workflows/liveness-primer.yml")
+COMMENT_WORKFLOW_PATH = Path(".github/workflows/liveness-primer-comment.yml")
 
 
 def _workflow():
     return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+
+def _comment_workflow():
+    return yaml.safe_load(COMMENT_WORKFLOW_PATH.read_text(encoding="utf-8"))
 
 
 def _comparison_step(workflow):
@@ -95,7 +100,8 @@ def test_liveness_primer_workflow_uses_locked_comparison_contract():
     workflow = _workflow()
     comparison = _comparison_step(workflow)
     assert comparison["env"] == {
-        "SKYLOS_REPOSITORY": "https://github.com/duriantaco/skylos",
+        # This fork measures its own commits, which upstream does not have.
+        "SKYLOS_REPOSITORY": "${{ github.server_url }}/${{ github.repository }}",
         "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
         "MERGE_SHA": "${{ github.sha }}",
         "REPORT_JSON": "liveness-primer-report.json",
@@ -135,6 +141,8 @@ def test_liveness_primer_workflow_preserves_evidence_without_write_access():
     assert set(artifact["with"]["path"].splitlines()) == {
         "liveness-primer-report.md",
         "liveness-primer-report.json",
+        # Liveness Primer Comment binds its comment target with this.
+        "pr-number.txt",
     }
 
     assert "pull_request_target" not in workflow_source
@@ -142,3 +150,28 @@ def test_liveness_primer_workflow_preserves_evidence_without_write_access():
     assert "pull-requests: write" not in workflow_source
     assert "gh pr comment" not in workflow_source
     assert scan_github_actions_file(WORKFLOW_PATH, root=".") == []
+
+
+def test_comment_workflow_consumes_this_workflow_by_name():
+    # An upstream sync that renames the measuring workflow silently detaches
+    # the comment job, which fails by never running at all.
+    comment = _comment_workflow()
+    triggers = comment.get("on", comment.get(True))
+    assert triggers["workflow_run"]["workflows"] == [_workflow()["name"]]
+
+
+def test_workflow_hands_the_comment_job_a_pull_request_number():
+    workflow = _workflow()
+    steps = workflow["jobs"]["blast-radius"]["steps"]
+
+    recorder = next(
+        step
+        for step in steps
+        if step.get("name") == "Record the pull request under measurement"
+    )
+    assert recorder["env"] == {"PR_NUMBER": "${{ github.event.pull_request.number }}"}
+    script = recorder["run"]
+    assert "${{" not in script
+    assert "set -euo pipefail" in script
+    assert "tr -dc '0-9'" in script
+    assert "> pr-number.txt" in script
