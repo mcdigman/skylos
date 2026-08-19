@@ -29,6 +29,7 @@ from skylos.rules.sca.vulnerability_scanner import (
     ECOSYSTEM_GO,
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
+    _extract_exact_npm_version,
     parse_go_mod,
     parse_package_json_candidates,
     parse_pyproject_toml_candidates,
@@ -52,7 +53,6 @@ STATUS_UNKNOWN = "unknown"
 VERSION_CACHE_SCHEMA_VERSION = 1
 VERSION_CACHE_PATH = Path(".skylos") / "cache" / "dependency_versions.json"
 MAX_VERSION_CACHE_BYTES = 5_000_000
-MAX_REGISTRY_RESPONSE_BYTES = 1_000_000
 MAX_INSTALL_SURFACE_BYTES = 1_000_000
 NPM_REGISTRY_ORIGIN = "https://registry.npmjs.org"
 GO_PROXY_ORIGIN = "https://proxy.golang.org"
@@ -1964,7 +1964,7 @@ def _check_pypi_version(name: str, version: str) -> str:
     safe_version = quote(version.strip(), safe="")
     version_url = f"{PYPI_JSON_ORIGIN}/{package_path}/{safe_version}/json"
     try:
-        _fetch_json(version_url, user_agent="skylos-pypi-dep-scanner/1.0")
+        _fetch_head(version_url, user_agent="skylos-pypi-dep-scanner/1.0")
         return STATUS_PRESENT
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
@@ -1974,7 +1974,7 @@ def _check_pypi_version(name: str, version: str) -> str:
 
     package_url = f"{PYPI_JSON_ORIGIN}/{package_path}/json"
     try:
-        _fetch_json(package_url, user_agent="skylos-pypi-dep-scanner/1.0")
+        _fetch_head(package_url, user_agent="skylos-pypi-dep-scanner/1.0")
         return STATUS_MISSING_VERSION
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -1989,22 +1989,42 @@ def _check_npm_version(name: str, version: str) -> str:
     if package_path is None:
         return STATUS_UNKNOWN
 
-    url = f"{NPM_REGISTRY_ORIGIN}/{package_path}"
+    raw_version = version.strip()
+    if not raw_version:
+        return STATUS_UNKNOWN
+
+    exact_version = _extract_exact_npm_version(raw_version)
+    if exact_version is None:
+        return _check_npm_package(package_path)
+
+    safe_version = quote(exact_version, safe="")
+    version_url = f"{NPM_REGISTRY_ORIGIN}/{package_path}/{safe_version}"
     try:
-        data = _fetch_json(url, user_agent="skylos-npm-dep-scanner/1.0")
+        _fetch_head(version_url, user_agent="skylos-npm-dep-scanner/1.0")
+        return STATUS_PRESENT
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return STATUS_UNKNOWN
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return STATUS_UNKNOWN
+
+    package_status = _check_npm_package(package_path)
+    if package_status == STATUS_PRESENT:
+        return STATUS_MISSING_VERSION
+    return package_status
+
+
+def _check_npm_package(package_path: str) -> str:
+    package_url = f"{NPM_REGISTRY_ORIGIN}/{package_path}"
+    try:
+        _fetch_head(package_url, user_agent="skylos-npm-dep-scanner/1.0")
+        return STATUS_PRESENT
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return STATUS_MISSING_PACKAGE
         return STATUS_UNKNOWN
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return STATUS_UNKNOWN
-
-    versions = data.get("versions")
-    if not isinstance(versions, dict):
-        return STATUS_UNKNOWN
-    if version in versions:
-        return STATUS_PRESENT
-    return STATUS_MISSING_VERSION
 
 
 def _check_go_version(name: str, version: str) -> str:
@@ -2016,7 +2036,7 @@ def _check_go_version(name: str, version: str) -> str:
     safe_go_version = quote(go_version, safe="")
     info_url = f"{GO_PROXY_ORIGIN}/{module_path}/@v/{safe_go_version}.info"
     try:
-        _fetch_text(info_url, user_agent="skylos-go-dep-scanner/1.0")
+        _fetch_head(info_url, user_agent="skylos-go-dep-scanner/1.0")
         return STATUS_PRESENT
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
@@ -2026,7 +2046,7 @@ def _check_go_version(name: str, version: str) -> str:
 
     list_url = f"{GO_PROXY_ORIGIN}/{module_path}/@v/list"
     try:
-        _fetch_text(list_url, user_agent="skylos-go-dep-scanner/1.0")
+        _fetch_head(list_url, user_agent="skylos-go-dep-scanner/1.0")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return STATUS_MISSING_PACKAGE
@@ -2132,30 +2152,17 @@ def _safe_go_path_part(value: str) -> bool:
     return True
 
 
-def _fetch_json(url: str, *, user_agent: str) -> dict[str, Any]:
-    text = _fetch_text(url, user_agent=user_agent)
-    data = json.loads(text)
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def _fetch_text(url: str, *, user_agent: str) -> str:
+def _fetch_head(url: str, *, user_agent: str) -> None:
     if not _allowed_registry_url(url):
         raise ValueError("Registry URL host is not allowed")
 
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(url, method="HEAD")
     request.add_header("User-Agent", user_agent)
-    with (
-        urllib.request.urlopen(  # skylos: ignore[SKY-D216] URL is validated against fixed registry hosts above.
-            request,
-            timeout=5,
-        ) as response
+    with urllib.request.urlopen(  # skylos: ignore[SKY-D216] URL is validated against fixed registry hosts above.
+        request,
+        timeout=5,
     ):
-        raw = response.read(MAX_REGISTRY_RESPONSE_BYTES + 1)
-    if len(raw) > MAX_REGISTRY_RESPONSE_BYTES:
-        raise ValueError("Registry response exceeds size limit")
-    return raw.decode("utf-8", errors="replace")
+        pass
 
 
 def _allowed_registry_url(url: str) -> bool:
