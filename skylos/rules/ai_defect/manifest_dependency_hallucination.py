@@ -29,6 +29,7 @@ from skylos.rules.sca.vulnerability_scanner import (
     ECOSYSTEM_GO,
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
+    _classify_npm_registry_spec,
     parse_go_mod,
     parse_package_json_candidates,
     parse_pyproject_toml_candidates,
@@ -49,10 +50,9 @@ STATUS_MISSING_VERSION = "missing_version"
 STATUS_SUSPICIOUS_EXISTING = "suspicious_existing"
 STATUS_PRIVATE_OR_UNVERIFIED = "private_or_unverified"
 STATUS_UNKNOWN = "unknown"
-VERSION_CACHE_SCHEMA_VERSION = 1
+VERSION_CACHE_SCHEMA_VERSION = 2
 VERSION_CACHE_PATH = Path(".skylos") / "cache" / "dependency_versions.json"
 MAX_VERSION_CACHE_BYTES = 5_000_000
-MAX_REGISTRY_RESPONSE_BYTES = 1_000_000
 MAX_INSTALL_SURFACE_BYTES = 1_000_000
 NPM_REGISTRY_ORIGIN = "https://registry.npmjs.org"
 GO_PROXY_ORIGIN = "https://proxy.golang.org"
@@ -211,8 +211,9 @@ def scan_manifest_dependency_hallucinations(
                 str(dependency["version"]),
                 cache,
             )
-            if _record_dependency_status(dependency, cache, status):
-                cache_changed = True
+        status = _status_for_dependency_spec(dependency, status)
+        if _record_dependency_status(dependency, cache, status):
+            cache_changed = True
 
         state = normalize_dependency_truth_state(status)
         reason = ""
@@ -1398,7 +1399,11 @@ def _dependencies_from_npm_args(
         parsed = _parse_npm_install_spec(spec)
         if parsed is None:
             continue
-        name, version = parsed
+        name, version_spec = parsed
+        classified = _classify_npm_registry_spec(version_spec)
+        if classified is None:
+            continue
+        version, exact = classified
         dependency = _install_dependency(
             path,
             line_no,
@@ -1407,6 +1412,8 @@ def _dependencies_from_npm_args(
             name=name,
             version=version,
         )
+        dependency["version_spec"] = version_spec
+        dependency["exact"] = exact
         if private_or_unverified:
             dependency = _private_or_unverified_dependency(
                 dependency,
@@ -1553,7 +1560,7 @@ def _parse_npm_install_spec(spec: str) -> tuple[str, str] | None:
         return None
     name = raw[:split_at]
     version = raw[split_at + 1 :]
-    if not name or not version or not version[0].isdigit():
+    if not name or not version:
         return None
     if raw.startswith("@") and "/" not in name:
         return None
@@ -1655,11 +1662,24 @@ def _unique_dependencies(dependencies: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _dependency_unique_key(dependency: dict[str, Any]) -> str:
-    key = _dependency_key(dependency)
+    key = _dependency_status_key(dependency)
     state = normalize_dependency_truth_state(dependency.get("dependency_truth_state"))
     if state == DependencyTruthState.PRIVATE_OR_UNVERIFIED:
         return f"{key}:private_or_unverified"
     return f"{key}:registry"
+
+
+def _dependency_status_key(dependency: dict[str, Any]) -> str:
+    if (
+        str(dependency.get("ecosystem", "")) == ECOSYSTEM_NPM
+        and dependency.get("exact") is False
+    ):
+        return dependency_truth_cache_key(
+            ECOSYSTEM_NPM,
+            str(dependency.get("name", "")),
+            "<package-only>",
+        )
+    return _dependency_key(dependency)
 
 
 def _dependency_key(dependency: dict[str, Any]) -> str:
@@ -1710,7 +1730,10 @@ def _cached_dependency_status(
     if not isinstance(statuses, dict):
         return None
 
-    for key in (_dependency_key(dependency), _legacy_dependency_key(dependency)):
+    for key in (
+        _dependency_status_key(dependency),
+        _legacy_dependency_key(dependency),
+    ):
         status = statuses.get(key)
         if not isinstance(status, str):
             continue
@@ -1732,8 +1755,26 @@ def _record_dependency_status(
     if not isinstance(statuses, dict):
         statuses = {}
         cache["statuses"] = statuses
-    statuses[_dependency_key(dependency)] = state.value
+    key = _dependency_status_key(dependency)
+    if statuses.get(key) == state.value:
+        return False
+    statuses[key] = state.value
     return True
+
+
+def _status_for_dependency_spec(
+    dependency: dict[str, Any],
+    status: DependencyTruthState | str,
+) -> str:
+    """Normalize results that cannot be authoritative for a non-exact spec."""
+    state = normalize_dependency_truth_state(status)
+    if (
+        str(dependency.get("ecosystem", "")) == ECOSYSTEM_NPM
+        and dependency.get("exact") is False
+        and state == DependencyTruthState.MISSING_VERSION
+    ):
+        return DependencyTruthState.PRESENT.value
+    return state.value
 
 
 def _finding_for_status(
@@ -1743,6 +1784,12 @@ def _finding_for_status(
     reason: str = "",
 ) -> dict[str, Any] | None:
     state = normalize_dependency_truth_state(status)
+    if (
+        str(dependency.get("ecosystem", "")) == ECOSYSTEM_NPM
+        and state == DependencyTruthState.MISSING_VERSION
+        and dependency.get("exact") is False
+    ):
+        return None
     source = (
         "registry+lookalike"
         if state == DependencyTruthState.SUSPICIOUS_EXISTING
@@ -1834,6 +1881,23 @@ def _finding(
     truth: DependencyTruthResult,
     confidence: int = 86,
 ) -> dict[str, Any]:
+    metadata = {
+        "ecosystem": dependency["ecosystem"],
+        "package_name": dependency["name"],
+        "package_version": dependency["version"],
+        "dependency_source": dependency.get("source", "manifest"),
+        **truth.to_metadata(),
+    }
+    for key in (
+        "version_spec",
+        "exact",
+        "dependency_section",
+        "dependency_optional",
+        "peer_dependency_optional",
+    ):
+        if key in dependency:
+            metadata[key] = dependency[key]
+
     return {
         "rule_id": rule_id,
         "severity": severity,
@@ -1847,13 +1911,7 @@ def _finding(
         "vibe_category": VIBE_CATEGORY,
         "ai_likelihood": AI_LIKELIHOOD,
         "confidence": confidence,
-        "metadata": {
-            "ecosystem": dependency["ecosystem"],
-            "package_name": dependency["name"],
-            "package_version": dependency["version"],
-            "dependency_source": dependency.get("source", "manifest"),
-            **truth.to_metadata(),
-        },
+        "metadata": metadata,
     }
 
 
@@ -1963,25 +2021,12 @@ def _check_pypi_version(name: str, version: str) -> str:
 
     safe_version = quote(version.strip(), safe="")
     version_url = f"{PYPI_JSON_ORIGIN}/{package_path}/{safe_version}/json"
-    try:
-        _fetch_json(version_url, user_agent="skylos-pypi-dep-scanner/1.0")
-        return STATUS_PRESENT
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            return STATUS_UNKNOWN
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return STATUS_UNKNOWN
-
     package_url = f"{PYPI_JSON_ORIGIN}/{package_path}/json"
-    try:
-        _fetch_json(package_url, user_agent="skylos-pypi-dep-scanner/1.0")
-        return STATUS_MISSING_VERSION
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return STATUS_MISSING_PACKAGE
-        return STATUS_UNKNOWN
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return STATUS_UNKNOWN
+    return _check_registry_version_urls(
+        version_url,
+        package_url,
+        user_agent="skylos-pypi-dep-scanner/1.0",
+    )
 
 
 def _check_npm_version(name: str, version: str) -> str:
@@ -1989,22 +2034,34 @@ def _check_npm_version(name: str, version: str) -> str:
     if package_path is None:
         return STATUS_UNKNOWN
 
-    url = f"{NPM_REGISTRY_ORIGIN}/{package_path}"
-    try:
-        data = _fetch_json(url, user_agent="skylos-npm-dep-scanner/1.0")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return STATUS_MISSING_PACKAGE
-        return STATUS_UNKNOWN
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    classified = _classify_npm_registry_spec(version)
+    if classified is None:
         return STATUS_UNKNOWN
 
-    versions = data.get("versions")
-    if not isinstance(versions, dict):
-        return STATUS_UNKNOWN
-    if version in versions:
+    lookup_version, exact = classified
+    package_url = f"{NPM_REGISTRY_ORIGIN}/{package_path}"
+    if not exact:
+        return _check_registry_package_url(
+            package_url,
+            user_agent="skylos-npm-dep-scanner/1.0",
+        )
+
+    safe_version = quote(lookup_version, safe="")
+    version_url = f"{package_url}/{safe_version}"
+    return _check_registry_version_urls(
+        version_url,
+        package_url,
+        user_agent="skylos-npm-dep-scanner/1.0",
+    )
+
+
+def _check_registry_package_url(package_url: str, *, user_agent: str) -> str:
+    package_status = _registry_http_status(package_url, user_agent=user_agent)
+    if package_status == 200:
         return STATUS_PRESENT
-    return STATUS_MISSING_VERSION
+    if package_status == 404:
+        return STATUS_MISSING_PACKAGE
+    return STATUS_UNKNOWN
 
 
 def _check_go_version(name: str, version: str) -> str:
@@ -2015,25 +2072,30 @@ def _check_go_version(name: str, version: str) -> str:
     go_version = _go_version(version)
     safe_go_version = quote(go_version, safe="")
     info_url = f"{GO_PROXY_ORIGIN}/{module_path}/@v/{safe_go_version}.info"
-    try:
-        _fetch_text(info_url, user_agent="skylos-go-dep-scanner/1.0")
+    list_url = f"{GO_PROXY_ORIGIN}/{module_path}/@v/list"
+    return _check_registry_version_urls(
+        info_url,
+        list_url,
+        user_agent="skylos-go-dep-scanner/1.0",
+    )
+
+
+def _check_registry_version_urls(
+    version_url: str,
+    package_url: str,
+    *,
+    user_agent: str,
+) -> str:
+    version_status = _registry_http_status(version_url, user_agent=user_agent)
+    if version_status == 200:
         return STATUS_PRESENT
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            return STATUS_UNKNOWN
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    if version_status != 404:
         return STATUS_UNKNOWN
 
-    list_url = f"{GO_PROXY_ORIGIN}/{module_path}/@v/list"
-    try:
-        _fetch_text(list_url, user_agent="skylos-go-dep-scanner/1.0")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return STATUS_MISSING_PACKAGE
-        return STATUS_UNKNOWN
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return STATUS_UNKNOWN
-    return STATUS_MISSING_VERSION
+    package_status = _registry_http_status(package_url, user_agent=user_agent)
+    if package_status == 200:
+        return STATUS_MISSING_VERSION
+    return STATUS_MISSING_PACKAGE if package_status == 404 else STATUS_UNKNOWN
 
 
 def _go_version(version: str) -> str:
@@ -2132,30 +2194,22 @@ def _safe_go_path_part(value: str) -> bool:
     return True
 
 
-def _fetch_json(url: str, *, user_agent: str) -> dict[str, Any]:
-    text = _fetch_text(url, user_agent=user_agent)
-    data = json.loads(text)
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def _fetch_text(url: str, *, user_agent: str) -> str:
-    if not _allowed_registry_url(url):
-        raise ValueError("Registry URL host is not allowed")
-
-    request = urllib.request.Request(url, method="GET")
-    request.add_header("User-Agent", user_agent)
-    with (
-        urllib.request.urlopen(  # skylos: ignore[SKY-D216] URL is validated against fixed registry hosts above.
+def _registry_http_status(url: str, *, user_agent: str) -> int | None:
+    try:
+        if not _allowed_registry_url(url):
+            raise ValueError("Registry URL host is not allowed")
+        request = urllib.request.Request(url, method="HEAD")
+        request.add_header("User-Agent", user_agent)
+        with urllib.request.urlopen(  # skylos: ignore[SKY-D216] fixed registry host
             request,
             timeout=5,
-        ) as response
-    ):
-        raw = response.read(MAX_REGISTRY_RESPONSE_BYTES + 1)
-    if len(raw) > MAX_REGISTRY_RESPONSE_BYTES:
-        raise ValueError("Registry response exceeds size limit")
-    return raw.decode("utf-8", errors="replace")
+        ):
+            pass
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    return 200
 
 
 def _allowed_registry_url(url: str) -> bool:

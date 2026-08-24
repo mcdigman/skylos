@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ast
 import re
-import sys
 
 
 _INJECTION_TAG_RE = re.compile(
@@ -147,7 +146,7 @@ def _get_decorator_description(decorator):
     return None
 
 
-class _MCPChecker(ast.NodeVisitor):
+class _MCPChecker:
     def __init__(self, file_path, findings):
         self.file_path = file_path
         self.findings = findings
@@ -165,23 +164,27 @@ class _MCPChecker(ast.NodeVisitor):
             }
         )
 
-    def generic_visit(self, node):
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, ast.AST):
-                        self.visit(item)
-            elif isinstance(value, ast.AST):
-                self.visit(value)
+    def check(self, tree):
+        """Walk the tree without depending on Python's recursion limit."""
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Assign):
+                self._record_server_assignment(node)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._check_mcp_function(node)
+            elif isinstance(node, ast.Call):
+                self._check_call(node)
 
-    def visit_Assign(self, node):
+            stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+    def _record_server_assignment(self, node):
         if isinstance(node.value, ast.Call):
             qn = _qualified_name(node.value)
             if qn and any(qn.endswith(cls) for cls in _MCP_SERVER_CLASSES):
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         self._mcp_server_vars.add(target.id)
-        self.generic_visit(node)
 
     def _check_text_for_injection(self, text, node, context):
         if _INJECTION_TAG_RE.search(text):
@@ -205,14 +208,6 @@ class _MCPChecker(ast.NodeVisitor):
                 f"MCP tool poisoning: hidden Unicode characters in {context}.",
                 severity="HIGH",
             )
-
-    def visit_FunctionDef(self, node):
-        self._check_mcp_function(node)
-        self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self._check_mcp_function(node)
-        self.generic_visit(node)
 
     def _check_mcp_function(self, node):
         if not _is_mcp_tool_function(node):
@@ -267,11 +262,12 @@ class _MCPChecker(ast.NodeVisitor):
         defaults = []
         args_obj = node.args
 
-        num_args = len(args_obj.args)
+        positional_args = [*args_obj.posonlyargs, *args_obj.args]
+        num_args = len(positional_args)
         num_defaults = len(args_obj.defaults)
         offset = num_args - num_defaults
         for i, default in enumerate(args_obj.defaults):
-            arg = args_obj.args[offset + i]
+            arg = positional_args[offset + i]
             defaults.append((arg.arg, default))
 
         for arg, default in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
@@ -292,10 +288,9 @@ class _MCPChecker(ast.NodeVisitor):
                     )
                     break
 
-    def visit_Call(self, node):
+    def _check_call(self, node):
         qn = _qualified_name(node)
         if not qn:
-            self.generic_visit(node)
             return
 
         parts = qn.rsplit(".", 1)
@@ -307,8 +302,6 @@ class _MCPChecker(ast.NodeVisitor):
                 "app",
             ):
                 self._check_server_run(node)
-
-        self.generic_visit(node)
 
     def _check_server_run(self, node):
         transport = None
@@ -358,8 +351,5 @@ class _MCPChecker(ast.NodeVisitor):
 def scan(tree, file_path, findings):
     if not _is_mcp_file(tree):
         return
-    try:
-        checker = _MCPChecker(file_path, findings)
-        checker.visit(tree)
-    except Exception as e:
-        print(f"MCP analysis failed for {file_path}: {e}", file=sys.stderr)
+    checker = _MCPChecker(file_path, findings)
+    checker.check(tree)

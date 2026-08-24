@@ -531,6 +531,8 @@ def test_tests_workflow_pins_codecov_and_limits_permissions():
     assert len(action_ref) == 40
     assert all(c in "0123456789abcdef" for c in action_ref)
     assert codecov_step["with"]["token"] == "${{ secrets.CODECOV_TOKEN }}"
+    assert codecov_step["with"]["files"] == "./coverage.xml"
+    assert codecov_step["with"]["disable_search"] is True
 
 
 def test_tests_workflow_preserves_unlocked_uv_pip_environment():
@@ -631,10 +633,14 @@ def test_skylos_pr_workflow_builds_go_engine_from_immutable_base():
 
 
 def test_skylos_workflow_reports_incomplete_scan_before_preserving_exit_code():
-    steps = _skylos_workflow()["jobs"]["scan"]["steps"]
+    scan_job = _skylos_workflow()["jobs"]["scan"]
+    assert scan_job["timeout-minutes"] == 20
+
+    steps = scan_job["steps"]
     scan_step = next(s for s in steps if s.get("name") == "Run Skylos")
     scan_script = scan_step["run"]
 
+    assert scan_step["env"]["SKYLOS_GREP_BUDGET"] == "120"
     assert "set +e" in scan_script
     assert "SCAN_STATUS=$?" in scan_script
     assert 'echo "status=$SCAN_STATUS" >> "$GITHUB_OUTPUT"' in scan_script

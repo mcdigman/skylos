@@ -51,6 +51,72 @@ def test_clone_similarity_threshold_keeps_possible_matches(monkeypatch):
     assert clones_mod._similarity(a, b, threshold=0.9) >= 0.9
 
 
+def test_clone_group_type_tie_uses_canonical_order():
+    select_type = clones_mod._select_group_clone_type
+
+    assert select_type([clones_mod.CloneType.TYPE2, clones_mod.CloneType.TYPE1]) == (
+        clones_mod.CloneType.TYPE1
+    )
+    assert select_type([clones_mod.CloneType.TYPE3, clones_mod.CloneType.TYPE2]) == (
+        clones_mod.CloneType.TYPE2
+    )
+
+
+def test_clone_group_type_prefers_most_common_type():
+    assert (
+        clones_mod._select_group_clone_type(
+            [
+                clones_mod.CloneType.TYPE3,
+                clones_mod.CloneType.TYPE1,
+                clones_mod.CloneType.TYPE3,
+            ]
+        )
+        == clones_mod.CloneType.TYPE3
+    )
+
+
+def test_clone_group_type_empty_defaults_to_type3():
+    assert clones_mod._select_group_clone_type([]) == clones_mod.CloneType.TYPE3
+
+
+def test_group_pairs_uses_canonical_type_for_tied_edges():
+    def fragment(name, line):
+        return clones_mod.Fragment(
+            file_path="sample.py",
+            start_line=line,
+            end_line=line + 10,
+            name=name,
+            kind="function",
+            node_count=10,
+            text_norm=name,
+            ast_norm_type2=name,
+            ast_norm_type3=name,
+        )
+
+    first = fragment("first", 1)
+    second = fragment("second", 20)
+    third = fragment("third", 40)
+    pairs = [
+        clones_mod.ClonePair(
+            a=first,
+            b=second,
+            similarity=0.99,
+            clone_type=clones_mod.CloneType.TYPE3,
+        ),
+        clones_mod.ClonePair(
+            a=second,
+            b=third,
+            similarity=0.99,
+            clone_type=clones_mod.CloneType.TYPE2,
+        ),
+    ]
+
+    for ordered_pairs in (pairs, list(reversed(pairs))):
+        groups = clones_mod.group_pairs(ordered_pairs, clones_mod.CloneConfig())
+        assert len(groups) == 1
+        assert groups[0].clone_type == clones_mod.CloneType.TYPE2
+
+
 # --- SKY-L004: Try Block Patterns ---
 
 
@@ -387,6 +453,15 @@ password = os.environ["PASSWORD"]
         findings = check_code(rule, code)
         assert not any(f["rule_id"] == "SKY-L014" for f in findings)
 
+    def test_positional_only_default(self):
+        code = """
+def connect(api_password: str = "mysecretpassword123", /) -> None:
+    return None
+"""
+        rule = HardcodedCredentialRule()
+        findings = check_code(rule, code, filename="app.py")
+        assert [finding["name"] for finding in findings] == ["api_password"]
+
 
 # --- SKY-L032: Mock Or Placeholder Data ---
 
@@ -427,6 +502,60 @@ SAMPLE_URL = "https://example.com/users"
         findings = check_code(rule, code, filename="app.py")
         assert [f["name"] for f in findings] == ["SAMPLE_URL"]
         assert findings[0]["mock_data_type"] == "placeholder_domain"
+
+    def test_positional_only_placeholder_default(self):
+        code = """
+def notify(support_email: str = "test@example.com", /) -> None:
+    return None
+"""
+        rule = MockPlaceholderDataRule()
+        findings = check_code(rule, code, filename="app.py")
+        assert [finding["name"] for finding in findings] == ["support_email"]
+        assert findings[0]["mock_data_type"] == "placeholder_email"
+
+    def test_mixed_positional_defaults_preserve_names(self):
+        code = """
+def notify(
+    required: str,
+    protocol_email: str = "test@example.com",
+    /,
+    implementation_email: str = "test@example.com",
+) -> None:
+    return None
+"""
+        rule = MockPlaceholderDataRule()
+        findings = check_code(rule, code, filename="app.py")
+        assert [finding["name"] for finding in findings] == [
+            "protocol_email",
+            "implementation_email",
+        ]
+
+    def test_protocol_and_implementation_defaults_flagged(self):
+        code = """
+from typing import Protocol
+
+class Notifier(Protocol):
+    def notify(
+        self,
+        protocol_email: str = "test@example.com",
+        /,
+    ) -> None:
+        ...
+
+class ConcreteNotifier(Notifier):
+    def notify(
+        self,
+        implementation_email: str = "test@example.com",
+        /,
+    ) -> None:
+        return None
+"""
+        rule = MockPlaceholderDataRule()
+        findings = check_code(rule, code, filename="app.py")
+        assert {finding["name"] for finding in findings} == {
+            "protocol_email",
+            "implementation_email",
+        }
 
 
 # --- SKY-UC001: Unreachable Code ---
@@ -658,6 +787,117 @@ def process(data, count=5):
         rule = BooleanTrapRule()
         findings = check_code(rule, code)
         assert not any(f["rule_id"] == "SKY-L029" for f in findings)
+
+    def test_positional_only_bool_params(self):
+        code = """
+def render_page(page: str, recurse: bool = True, /, name: str = "index") -> str:
+    return page
+
+def paginate(page: str, deep=True, /, name: str = "index") -> str:
+    return page
+
+def log_page(verbose: bool = True, /) -> None:
+    return None
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+        l029 = [finding for finding in findings if finding["rule_id"] == "SKY-L029"]
+
+        assert [finding["simple_name"] for finding in l029] == [
+            "recurse",
+            "deep",
+        ]
+
+    def test_positional_only_bool_variants_preserve_default_alignment(self):
+        code = """
+async def refresh(active: "bool", /) -> None:
+    return None
+
+def configure(label="plain", /, enabled=False) -> None:
+    return None
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+        l029 = [finding for finding in findings if finding["rule_id"] == "SKY-L029"]
+
+        assert [finding["simple_name"] for finding in l029] == [
+            "active",
+            "enabled",
+        ]
+
+    def test_property_setter_value_is_not_a_boolean_trap_with_custom_receiver(self):
+        code = """
+class Settings:
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(instance, value: bool, /) -> None:
+        instance._enabled = value
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+
+        assert not any(finding["rule_id"] == "SKY-L029" for finding in findings)
+
+    def test_qualified_property_setter_value_is_not_a_boolean_trap(self):
+        code = """
+class Base:
+    @property
+    def enabled(self) -> bool:
+        return False
+
+class Settings(Base):
+    @Base.enabled.setter
+    def enabled(self, value: bool) -> None:
+        self._enabled = value
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+
+        assert not any(finding["rule_id"] == "SKY-L029" for finding in findings)
+
+    def test_property_setter_only_exempts_value_parameter(self):
+        code = """
+class Settings:
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool, announce: bool = False) -> None:
+        self._enabled = value
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+        l029 = [finding for finding in findings if finding["rule_id"] == "SKY-L029"]
+
+        assert [finding["simple_name"] for finding in l029] == ["announce"]
+
+    def test_setter_lookalikes_do_not_exempt_parameter(self):
+        code = """
+@setter
+def configure(enabled: bool) -> None:
+    return None
+
+@registry.setter
+def publish(active: bool) -> None:
+    return None
+
+@broken.setter
+def broken(value: bool) -> None:
+    return None
+"""
+        rule = BooleanTrapRule()
+        findings = check_code(rule, code)
+        l029 = [finding for finding in findings if finding["rule_id"] == "SKY-L029"]
+
+        assert [finding["simple_name"] for finding in l029] == [
+            "enabled",
+            "active",
+            "value",
+        ]
 
 
 # --- SKY-L017: Error Disclosure ---
