@@ -436,6 +436,96 @@ class TestSkylos:
 
         assert mock_def.is_exported
 
+    def test_mark_exports_marks_every_qualified_definition(
+        self, skylos, mock_definition
+    ):
+        definitions = [
+            mock_definition(
+                f"package.branch_{index}.published", "published", "function"
+            )
+            for index in range(3)
+        ]
+        for index, definition in enumerate(definitions):
+            definition.filename = Path(f"branch_{index}.ts")
+
+        skylos.defs = {
+            definition.name: definition for definition in reversed(definitions)
+        }
+        skylos.exports = {"package": {"published"}}
+
+        skylos._mark_exports()
+
+        assert all(definition.is_exported for definition in definitions)
+
+    def test_mark_exports_excludes_sibling_module_prefix(self, skylos, mock_definition):
+        exported = mock_definition("package.published", "published", "function")
+        sibling = mock_definition("package_extra.published", "published", "function")
+        exported.filename = Path("exported.ts")
+        sibling.filename = Path("sibling.ts")
+        skylos.defs = {
+            exported.name: exported,
+            sibling.name: sibling,
+        }
+        skylos.exports = {"package": {"published"}}
+
+        skylos._mark_exports()
+
+        assert exported.is_exported
+        assert not sibling.is_exported
+
+    def test_mark_exports_init_import_fallback_marks_non_import_candidates(
+        self, skylos, mock_definition
+    ):
+        import_definition = mock_definition(
+            "missing.published", "published", "import", in_init=True
+        )
+        candidates = [
+            mock_definition("first.published", "published", "function"),
+            mock_definition("second.published", "published", "function"),
+        ]
+        unrelated_import = mock_definition("third.published", "published", "import")
+        skylos.defs = {
+            "package/__init__.py:missing.published": import_definition,
+            candidates[0].name: candidates[0],
+            candidates[1].name: candidates[1],
+            "package/module.py:third.published": unrelated_import,
+        }
+
+        skylos._mark_exports()
+
+        assert all(candidate.is_exported for candidate in candidates)
+        assert all(candidate.references == 1 for candidate in candidates)
+        assert not unrelated_import.is_exported
+
+    def test_mark_exports_indexes_all_transitive_type_prefixes(
+        self, skylos, mock_definition
+    ):
+        root = mock_definition("package.Root", "Root", "class", is_exported=True)
+        children = [
+            mock_definition(f"package.Child{index}", f"Child{index}", "class")
+            for index in range(3)
+        ]
+        leaf = mock_definition("package.Leaf", "Leaf", "class")
+        sibling = mock_definition("package.Sibling", "Sibling", "class")
+        definitions = [root, *children, leaf, sibling]
+        skylos.defs = {definition.name: definition for definition in definitions}
+        skylos._global_type_map = {
+            "package.RootExtra.sibling": "Sibling",
+            "package.Root.third": "Child2",
+            "package.Child2.leaf": "Leaf",
+            "package.Root.first": "Child0",
+            "package.Root.second": "Child1",
+        }
+
+        skylos._mark_exports()
+
+        assert all(child.is_exported for child in children)
+        assert all(child.references == 1 for child in children)
+        assert leaf.is_exported
+        assert leaf.references == 1
+        assert not sibling.is_exported
+        assert sibling.references == 0
+
     def test_mark_refs_direct_reference(self, skylos):
         mock_def = Mock()
         mock_def.type = "function"

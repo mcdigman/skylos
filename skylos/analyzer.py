@@ -11,6 +11,8 @@ import subprocess
 import traceback
 from pathlib import Path
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from typing import TypeVar
 
 try:
     from skylos_fast import discover_files as _fast_discover
@@ -1209,21 +1211,28 @@ def _annotate_dead_code_evidence_sources(defs, test_flags, framework_flags) -> N
 
 
 _definition_name = attrgetter("name")
+_QualifiedCandidate = TypeVar("_QualifiedCandidate")
 
 
-def _qualified_candidates(definitions: list, qualifier: str) -> list:
-    """Definitions whose dotted name lives under ``qualifier.``, capped at two.
+def _qualified_candidates(
+    definitions: list[_QualifiedCandidate],
+    qualifier: str,
+    *,
+    key: Callable[[_QualifiedCandidate], str] = _definition_name,
+    limit: int | None = 2,
+) -> list[_QualifiedCandidate]:
+    """Return sorted values whose dotted key lives under ``qualifier``.
 
-    ``definitions`` must be sorted by ``name``. Callers only distinguish
-    zero / one / more-than-one, so the slice stops at two matches.
+    _mark_refs caller only distinguishes zero / one / more-than-one,
+    so the slice stops at two matches.
     """
     lower = f"{qualifier}."
-    # '/' is the code point right after '.', so it bounds every dotted
-    # descendant without scanning the bucket.
     upper = f"{qualifier}/"
-    start = bisect_left(definitions, lower, key=_definition_name)
-    stop = bisect_left(definitions, upper, start, key=_definition_name)
-    return definitions[start : min(stop, start + 2)]
+    start = bisect_left(definitions, lower, key=key)
+    stop = bisect_left(definitions, upper, start, key=key)
+    if limit is not None:
+        stop = min(stop, start + limit)
+    return definitions[start:stop]
 
 
 class Skylos:
@@ -1461,37 +1470,37 @@ class Skylos:
         return all_files
 
     def _mark_exports(self):
-        for name, definition in self.defs.items():
-            if definition.in_init and not definition.simple_name.startswith("_"):
-                definition.is_exported = True
-
         all_exported_names = set()
-        for mod, export_names in self.exports.items():
+        for export_names in self.exports.values():
             all_exported_names.update(export_names)
 
+        non_import_keys_by_simple = defaultdict(list)
         for def_name, def_obj in self.defs.items():
+            target_simple_name = def_obj.simple_name
+            if def_obj.in_init and not target_simple_name.startswith("_"):
+                def_obj.is_exported = True
+            if def_obj.type != "import":
+                non_import_keys_by_simple[target_simple_name].append(def_name)
             if str(def_obj.filename).endswith(_TS_JS_SOURCE_EXTS):
                 continue
-            if def_obj.simple_name in all_exported_names:
+            if target_simple_name in all_exported_names:
                 def_obj.is_exported = True
                 def_obj.references += 1
 
+        for definition_keys in non_import_keys_by_simple.values():
+            definition_keys.sort()
+
         for mod, export_names in self.exports.items():
             for name in export_names:
-                for def_name, def_obj in self.defs.items():
-                    if (
-                        def_name.startswith(f"{mod}.")
-                        and def_obj.simple_name == name
-                        and def_obj.type != "import"
-                    ):
-                        def_obj.is_exported = True
+                for def_name in _qualified_candidates(
+                    non_import_keys_by_simple.get(name, []),
+                    mod,
+                    key=str,
+                    limit=None,
+                ):
+                    self.defs[def_name].is_exported = True
 
-        non_import_by_simple = defaultdict(list)
-        for k, d in self.defs.items():
-            if d.type != "import":
-                non_import_by_simple[d.simple_name].append(d)
-
-        for def_key, def_obj in self.defs.items():
+        for def_obj in self.defs.values():
             if def_obj.type != "import":
                 continue
             if not def_obj.in_init:
@@ -1508,72 +1517,84 @@ class Skylos:
                 self.defs[target_name].references += 1
                 self.defs[target_name].is_exported = True
                 continue
-            for candidate in non_import_by_simple.get(simple, []):
+            for candidate_name in non_import_keys_by_simple.get(simple, []):
+                candidate = self.defs[candidate_name]
                 candidate.references += 1
                 candidate.is_exported = True
 
         # propogate exports to methods of exported classes
         exported_classes = set()
-        for def_name, def_obj in self.defs.items():
+        for def_obj in self.defs.values():
             if def_obj.type == "class" and def_obj.is_exported:
                 exported_classes.add(def_obj.name)
 
-        if exported_classes:
-            for def_name, def_obj in self.defs.items():
-                if def_obj.type not in ("function", "method"):
+        if not exported_classes:
+            # no exported classes to mark functions or methods, return early
+            return
+
+        for def_obj in self.defs.values():
+            if def_obj.type not in ("function", "method"):
+                continue
+            if str(def_obj.filename).endswith(
+                (".java",) + _CSHARP_SOURCE_EXTS + _KOTLIN_SOURCE_EXTS
+            ):
+                continue
+            if "." not in def_obj.name:
+                continue
+            parent = def_obj.name.rsplit(".", 1)[0]
+            if parent in exported_classes and not def_obj.simple_name.startswith("_"):
+                def_obj.is_exported = True
+                def_obj.references = max(def_obj.references, 1)
+
+        if not hasattr(self, "_global_type_map"):
+            # marking done, return early
+            return
+
+        # reverse lookup: simple class name -> set of qualified def names
+        class_by_simple: dict[str, set[str]] = defaultdict(set)
+        for def_obj in self.defs.values():
+            if def_obj.type == "class":
+                class_by_simple[def_obj.simple_name].add(def_obj.name)
+
+        queue = list(exported_classes)
+        visited = set(exported_classes)
+        transitive_classes: set[str] = set()
+
+        global_type_keys = sorted(self._global_type_map)
+
+        while queue:
+            cls_name = queue.pop()
+            for attr_key in _qualified_candidates(
+                global_type_keys,
+                cls_name,
+                key=str,
+                limit=None,
+            ):
+                type_name = self._global_type_map[attr_key]
+                for candidate in class_by_simple.get(type_name, set()):
+                    if candidate not in visited:
+                        visited.add(candidate)
+                        transitive_classes.add(candidate)
+                        queue.append(candidate)
+
+        if not transitive_classes:
+            # marking done, return early
+            return
+
+        for def_obj in self.defs.values():
+            target_name = def_obj.name
+            if def_obj.type == "class" and target_name in transitive_classes:
+                def_obj.is_exported = True
+                def_obj.references = max(def_obj.references, 1)
+            elif def_obj.type in ("function", "method") and "." in target_name:
+                if str(def_obj.filename).endswith(".java"):
                     continue
-                if str(def_obj.filename).endswith(
-                    (".java",) + _CSHARP_SOURCE_EXTS + _KOTLIN_SOURCE_EXTS
-                ):
-                    continue
-                if "." not in def_obj.name:
-                    continue
-                parent = def_obj.name.rsplit(".", 1)[0]
-                if parent in exported_classes and not def_obj.simple_name.startswith(
+                parent = target_name.rsplit(".", 1)[0]
+                if parent in transitive_classes and not def_obj.simple_name.startswith(
                     "_"
                 ):
                     def_obj.is_exported = True
                     def_obj.references = max(def_obj.references, 1)
-
-        if exported_classes and hasattr(self, "_global_type_map"):
-            # reverse lookup: simple class name -> set of qualified def names
-            class_by_simple: dict[str, set[str]] = defaultdict(set)
-            for def_name, def_obj in self.defs.items():
-                if def_obj.type == "class":
-                    class_by_simple[def_obj.simple_name].add(def_obj.name)
-
-            queue = list(exported_classes)
-            visited = set(exported_classes)
-            transitive_classes: set[str] = set()
-
-            while queue:
-                cls_name = queue.pop()
-                prefix = cls_name + "."
-                for attr_key, type_name in self._global_type_map.items():
-                    if not attr_key.startswith(prefix):
-                        continue
-                    candidates = class_by_simple.get(type_name, set())
-                    for candidate in candidates:
-                        if candidate not in visited:
-                            visited.add(candidate)
-                            transitive_classes.add(candidate)
-                            queue.append(candidate)
-
-            if transitive_classes:
-                for def_name, def_obj in self.defs.items():
-                    if def_obj.type == "class" and def_obj.name in transitive_classes:
-                        def_obj.is_exported = True
-                        def_obj.references = max(def_obj.references, 1)
-                    elif def_obj.type in ("function", "method") and "." in def_obj.name:
-                        if str(def_obj.filename).endswith(".java"):
-                            continue
-                        parent = def_obj.name.rsplit(".", 1)[0]
-                        if (
-                            parent in transitive_classes
-                            and not def_obj.simple_name.startswith("_")
-                        ):
-                            def_obj.is_exported = True
-                            def_obj.references = max(def_obj.references, 1)
 
     def _build_ts_import_graph(self, ts_raw_imports: dict, monorepo_resolver=None):
         (
