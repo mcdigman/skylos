@@ -1221,12 +1221,18 @@ def _qualified_candidates(
     key: Callable[[_QualifiedCandidate], str] = _definition_name,
     limit: int | None = 2,
 ) -> list[_QualifiedCandidate]:
-    """Return sorted values whose dotted key lives under ``qualifier``.
+    """Return the values whose dotted ``key`` lives under ``qualifier``.
 
-    _mark_refs caller only distinguishes zero / one / more-than-one,
-    so the slice stops at two matches.
+    ``definitions`` must already be sorted by ``key``; the lookup is a
+    bisect, so an unsorted input silently returns the wrong slice.
+
+    ``limit`` caps the number of matches returned. The default of two
+    serves _mark_refs, which only distinguishes zero / one / more-than-one;
+    pass ``None`` when every match matters.
     """
     lower = f"{qualifier}."
+    # '/' is the code point right after '.', so it bounds every dotted
+    # descendant without scanning the bucket.
     upper = f"{qualifier}/"
     start = bisect_left(definitions, lower, key=key)
     stop = bisect_left(definitions, upper, start, key=key)
@@ -1489,6 +1495,10 @@ class Skylos:
 
         for definition_keys in non_import_keys_by_simple.values():
             definition_keys.sort()
+        # Frozen to a plain dict now that the lists are sorted: the lookups
+        # below bisect them, and a defaultdict would let a later
+        # ``[key].append(...)`` break that ordering with no error.
+        non_import_keys_by_simple = dict(non_import_keys_by_simple)
 
         for mod, export_names in self.exports.items():
             for name in export_names:
