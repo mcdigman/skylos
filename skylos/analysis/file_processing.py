@@ -141,7 +141,7 @@ LINTER_RULE_NODE_TYPES = {
         ast.AsyncWith,
         *TRY_NODE_TYPES,
     ),
-    PerformanceRule: (ast.Call, ast.For),
+    PerformanceRule: (ast.Module, ast.Call),
     TypeAnnotationPracticeRule: (ast.Module,),
     FrameworkPracticeRule: (ast.Module,),
     OpaqueIdentifierRule: (ast.Module,),

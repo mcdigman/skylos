@@ -628,8 +628,8 @@ df = pd.read_csv('data.csv', chunksize=1000)
         code = """
 for item in data:
     for other in data:
-        if item == other:
-            pass
+        if item.id == other.item_id:
+            process(item, other)
 """
         rule = PerformanceRule(ignore_list=[])
         findings = check_code(rule, code)

@@ -520,7 +520,7 @@ use the `SKY-A` prefix.
 | C401 | MEDIUM | Duplicated implementation fragments | Python |
 | P401 | LOW | Memory risk: `file.read()` / `readlines()` | Python |
 | P402 | LOW | Memory risk: `pandas.read_csv` without `chunksize` | Python |
-| P403 | LOW | Nested loop O(N^2) | Python / generic |
+| P403 | LOW | Repeated linear lookup / nested-loop equality join | Python |
 | P404 | MEDIUM | Unbounded SQLAlchemy-style ORM `.all()` query | Python |
 | T101 | MEDIUM | Missing public parameter type annotation | Python |
 | T102 | MEDIUM | Missing public return type annotation | Python |
