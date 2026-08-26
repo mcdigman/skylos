@@ -221,7 +221,7 @@ def scan_repo_phantom_security_references(
         )
         ast_index = _ast_index_for(tree)
         parent_map = ast_index.parent_map
-        scope_infos = _build_scope_infos(tree, current_module, local_modules)
+        scope_infos = _scope_infos_for(tree, current_module, local_modules)
         type_checking_node_ids = module_type_checking_node_ids.get(
             current_module, set()
         )
@@ -1300,6 +1300,31 @@ def _build_ast_index(tree):
         import_nodes=import_nodes,
         scan_nodes=scan_nodes,
     )
+
+
+_SCOPE_INFOS_CACHE: dict[int, tuple[str, set, dict]] = {}
+
+
+def _scope_infos_for(tree, current_module, local_modules):
+    """Memoized ``_build_scope_infos``, shared across rule passes.
+
+    The phantom-ref scan and the API hallucination coverage pass build
+    identical scope infos for the same tree/module; keyed by id(tree)
+    (trees are held by the run-scoped AST cache, which clears this).
+    """
+    cached = _SCOPE_INFOS_CACHE.get(id(tree))
+    if (
+        cached is not None
+        and cached[0] == current_module
+        and cached[1] == local_modules
+    ):
+        return cached[2]
+    scope_infos = _build_scope_infos(tree, current_module, local_modules)
+    _SCOPE_INFOS_CACHE[id(tree)] = (current_module, local_modules, scope_infos)
+    return scope_infos
+
+
+register_dependent_clear(_SCOPE_INFOS_CACHE.clear)
 
 
 def _build_scope_infos(tree, current_module, local_modules):

@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from skylos.analysis.ast_cache import MODE_SAFE_REPLACE_2MB, load_python_module
 from skylos.rules.ai_defect.phantom_refs import (
     _ast_index_for,
-    _build_scope_infos,
+    _scope_infos_for,
     _collect_module_facts,
     _module_dunder_attributes,
     _module_has_member,
@@ -175,7 +175,7 @@ def _inspect_target_references(
     module_dunder_attributes: frozenset[str],
 ) -> None:
     ast_index = _ast_index_for(tree)
-    scope_infos = _build_scope_infos(tree, current_module, local_modules)
+    scope_infos = _scope_infos_for(tree, current_module, local_modules)
 
     def ensure_module_loaded(module_name: str) -> bool:
         return module_name in trees
