@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from skylos.analysis.ast_cache import MODE_REPLACE, load_python_module
 from skylos.analysis.control_flow import _parse_requires_python
 from skylos.rules.quality._protocols import (
     type_checking_context,
@@ -182,10 +183,8 @@ def scan_repo_phantom_security_references(
             parse_failures.add(module_name)
             return False
 
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source)
-        except (OSError, SyntaxError):
+        source, tree = load_python_module(file_path, MODE_REPLACE)
+        if tree is None:
             parse_failures.add(module_name)
             return False
 
@@ -206,10 +205,8 @@ def scan_repo_phantom_security_references(
     for file_path, current_module in file_to_module.items():
         if target_paths and file_path not in target_paths:
             continue
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source)
-        except (OSError, SyntaxError):
+        source, tree = load_python_module(file_path, MODE_REPLACE)
+        if tree is None:
             continue
 
         _store_module_facts(

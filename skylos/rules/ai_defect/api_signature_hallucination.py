@@ -8,13 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from skylos.core.python_api_surface import PythonApiSurfaceCacheSession
-from skylos.core.safe_cache_io import read_text_no_symlink
+from skylos.analysis.ast_cache import (
+    MODE_SAFE_IGNORE_1MB,
+    load_python_module,
+    load_python_source,
+)
 
 RULE_ID_API_SIGNATURE = "SKY-D224"
 SEV_HIGH = "HIGH"
 DEFAULT_API_SIGNATURE_ALLOWLIST = ("requests", "pandas", "boto3", "openai")
 VIBE_CATEGORY = "api_signature_hallucination"
 AI_LIKELIHOOD = "high"
+# Source-size cap enforced by ast_cache's MODE_SAFE_IGNORE_1MB read mode.
 MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES = 1_000_000
 _MAX_API_SIGNATURE_PREFILTER_ROOTS = 64
 
@@ -411,12 +416,7 @@ def _parse_python_file(
     if not resolved.is_file():
         return None
 
-    source = read_text_no_symlink(
-        resolved,
-        max_bytes=MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES,
-        encoding="utf-8",
-        errors="ignore",
-    )
+    source = load_python_source(resolved, MODE_SAFE_IGNORE_1MB)
     if source is None:
         return None
     if (
@@ -425,10 +425,8 @@ def _parse_python_file(
     ):
         return None
 
-    try:
-        return ast.parse(source)
-    except SyntaxError:
-        return None
+    _, tree = load_python_module(resolved, MODE_SAFE_IGNORE_1MB)
+    return tree
 
 
 def _source_mentions_allowed_root(source: str, allowed_roots: set[str]) -> bool:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from skylos.core.safe_cache_io import read_text_no_symlink
+from skylos.analysis.ast_cache import MODE_SAFE_REPLACE_2MB, load_python_module
 from skylos.rules.ai_defect.phantom_refs import (
     _build_parent_map,
     _build_scope_infos,
@@ -22,7 +22,6 @@ from skylos.rules.vibe_dictionary import DEFAULT_VIBE_DICTIONARY
 
 
 PYTHON_API_CHECK_ID = "python_local_api_reference"
-_MAX_PYTHON_SOURCE_BYTES = 2 * 1024 * 1024
 PYTHON_API_SUFFIXES = (".py", ".pyi", ".pyw")
 
 
@@ -477,18 +476,12 @@ def _load_module_facts(
 
 
 def _parse_python_file(path: Path) -> tuple[ast.AST | None, str | None, bool]:
-    source = read_text_no_symlink(
-        path,
-        max_bytes=_MAX_PYTHON_SOURCE_BYTES,
-        encoding="utf-8",
-        errors="replace",
-    )
+    source, tree = load_python_module(path, MODE_SAFE_REPLACE_2MB)
     if source is None:
         return None, "source_unreadable", False
-    try:
-        return ast.parse(source), None, "TYPE_CHECKING" in source
-    except SyntaxError:
+    if tree is None:
         return None, "parse_error", "TYPE_CHECKING" in source
+    return tree, None, "TYPE_CHECKING" in source
 
 
 def _safe_root(project_root: str | Path) -> Path | None:

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from skylos.analysis.ast_cache import MODE_STRICT, load_python_module
+
 
 @dataclass(frozen=True)
 class ParsedPythonFile:
@@ -15,9 +17,8 @@ class ParsedPythonFile:
 def parse_python_files(files: Iterable[Path]) -> list[ParsedPythonFile]:
     parsed: list[ParsedPythonFile] = []
     for path in files:
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError, UnicodeDecodeError):
+        _, tree = load_python_module(path, MODE_STRICT)
+        if tree is None:
             continue
         parsed.append(ParsedPythonFile(path=path, tree=tree))
     return parsed

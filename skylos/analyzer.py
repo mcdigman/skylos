@@ -41,6 +41,7 @@ from skylos.visitors.languages.typescript.analysis import (
     find_dead_ts_files,
     find_unused_ts_exports,
 )
+from skylos.analysis.ast_cache import clear_python_ast_cache
 from skylos.visitors.languages.go import clear_go_cache
 
 from skylos.rules.secrets import (
@@ -2794,6 +2795,7 @@ class Skylos:
             self._reset_run_state()
         self._has_analyzed = True
         clear_go_cache()
+        clear_python_ast_cache()
         self._sca_coverage = None
 
         raw_first = Path(
@@ -4649,27 +4651,30 @@ def analyze(
     required_config_rules=None,
     grep_cache=True,
 ) -> str:
-    return Skylos().analyze(
-        path,
-        thr=conf,
-        exclude_folders=exclude_folders,
-        enable_secrets=enable_secrets,
-        enable_danger=enable_danger,
-        enable_quality=enable_quality,
-        enable_ai_defects=enable_ai_defects,
-        enable_dependency_hallucinations=enable_dependency_hallucinations,
-        extra_visitors=extra_visitors,
-        progress_callback=progress_callback,
-        custom_rules_data=custom_rules_data,
-        changed_files=changed_files,
-        grep_verify=grep_verify,
-        grep_cache=grep_cache,
-        enable_sca=enable_sca,
-        trace_file=trace_file,
-        config_file=config_file,
-        project_config_overrides=project_config_overrides,
-        required_config_rules=required_config_rules,
-    )
+    try:
+        return Skylos().analyze(
+            path,
+            thr=conf,
+            exclude_folders=exclude_folders,
+            enable_secrets=enable_secrets,
+            enable_danger=enable_danger,
+            enable_quality=enable_quality,
+            enable_ai_defects=enable_ai_defects,
+            enable_dependency_hallucinations=enable_dependency_hallucinations,
+            extra_visitors=extra_visitors,
+            progress_callback=progress_callback,
+            custom_rules_data=custom_rules_data,
+            changed_files=changed_files,
+            grep_verify=grep_verify,
+            grep_cache=grep_cache,
+            enable_sca=enable_sca,
+            trace_file=trace_file,
+            config_file=config_file,
+            project_config_overrides=project_config_overrides,
+            required_config_rules=required_config_rules,
+        )
+    finally:
+        clear_python_ast_cache()
 
 
 if __name__ == "__main__":
