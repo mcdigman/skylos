@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from skylos.analysis.ast_cache import MODE_SAFE_REPLACE_2MB, load_python_module
 from skylos.rules.ai_defect.phantom_refs import (
-    _build_parent_map,
+    _ast_index_for,
     _build_scope_infos,
     _collect_module_facts,
     _module_dunder_attributes,
@@ -174,7 +174,7 @@ def _inspect_target_references(
     state: _PythonCoverageState,
     module_dunder_attributes: frozenset[str],
 ) -> None:
-    parent_map = _build_parent_map(tree)
+    ast_index = _ast_index_for(tree)
     scope_infos = _build_scope_infos(tree, current_module, local_modules)
 
     def ensure_module_loaded(module_name: str) -> bool:
@@ -183,7 +183,7 @@ def _inspect_target_references(
     _inspect_import_references(
         root,
         current_module,
-        tree,
+        ast_index,
         local_modules,
         trees,
         members,
@@ -196,7 +196,7 @@ def _inspect_target_references(
         module_dunder_attributes,
     )
 
-    for expression, owner in _reference_expressions(tree, parent_map):
+    for expression, owner in _reference_expressions(ast_index):
         if (
             id(expression) in type_checking_node_ids
             or id(owner) in type_checking_node_ids
@@ -212,7 +212,7 @@ def _inspect_target_references(
             expr=expression,
             node=owner,
             tree=tree,
-            parent_map=parent_map,
+            ast_index=ast_index,
             scope_infos=scope_infos,
             module_alias_exports=active_aliases,
             local_modules=local_modules,
@@ -236,14 +236,11 @@ def _inspect_target_references(
             state.verified += 1
 
 
-def _reference_expressions(
-    tree: ast.AST,
-    parent_map: dict[ast.AST, ast.AST],
-) -> Iterable[tuple[ast.AST, ast.AST]]:
-    for node in ast.walk(tree):
+def _reference_expressions(ast_index) -> Iterable[tuple[ast.AST, ast.AST]]:
+    for node in ast_index.scan_nodes:
         if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
             continue
-        parent = parent_map.get(node)
+        parent = ast_index.parent_map.get(node)
         if isinstance(parent, ast.Attribute) and parent.value is node:
             continue
         owner = parent if isinstance(parent, ast.Call) and parent.func is node else node
@@ -253,7 +250,7 @@ def _reference_expressions(
 def _inspect_import_references(
     root: Path,
     current_module: str,
-    tree: ast.AST,
+    ast_index,
     local_modules: set[str],
     trees: dict[str, ast.AST],
     members: dict[str, set[str]],
@@ -265,7 +262,7 @@ def _inspect_import_references(
     state: _PythonCoverageState,
     module_dunder_attributes: frozenset[str],
 ) -> None:
-    for node in ast.walk(tree):
+    for node in ast_index.import_nodes:
         if isinstance(node, ast.ImportFrom):
             _inspect_from_import(
                 root,
