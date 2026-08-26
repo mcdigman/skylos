@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from collections import defaultdict
 from skylos.visitors.test_aware import TestAwareVisitor
 from skylos.visitors.framework_aware import FrameworkAwareVisitor
-from skylos.analysis.penalties import apply_penalties
+from skylos.analysis.penalties import _check_abstract_overrides, apply_penalties
 from skylos.deadcode.config_entrypoints import configured_entrypoint_reason
 from skylos.engines.go_runner import GoEngineError
 
@@ -170,7 +170,8 @@ class TestSkylos:
         source_root = tmp_path / "source"
         source_root.mkdir()
         (source_root / "module.py").write_text(
-            "def helper():\n    return 1\n", encoding="utf-8"
+            "class Worker:\n    def helper(self):\n        return 1\n",
+            encoding="utf-8",
         )
 
         skylos.analyze(str(source_root), thr=0, grep_verify=False, trace_file=False)
@@ -178,6 +179,7 @@ class TestSkylos:
             "_module_root_path",
             "pattern_trackers",
             "_global_type_map",
+            "_abstract_override_indexes",
             "_grep_verify_report",
             "_dead_code_liveness_report",
             "ts_consumed_exports",
@@ -473,6 +475,136 @@ class TestSkylos:
         assert mock_import.references == 1
         assert mock_original.references == 2
 
+    def test_mark_refs_qualified_prefix_includes_descendant_definitions(
+        self, skylos, mock_definition
+    ):
+        nested = mock_definition(
+            name="package.Parent.Nested.target",
+            simple_name="target",
+            type="function",
+        )
+        other = mock_definition(
+            name="package.Other.target",
+            simple_name="target",
+            type="function",
+        )
+        skylos.defs = {
+            nested.name: nested,
+            other.name: other,
+        }
+        skylos.refs = [("package.Parent.target", Path("caller.py"))]
+        skylos._global_type_map = {}
+
+        skylos._mark_refs()
+
+        assert nested.references == 1
+        assert other.references == 0
+
+    def test_mark_refs_qualified_prefix_prefers_unique_same_file_definition(
+        self, skylos, mock_definition
+    ):
+        local = mock_definition(
+            name="package.Parent.Local.target",
+            simple_name="target",
+            type="function",
+        )
+        local.filename = Path("local.py")
+        remote = mock_definition(
+            name="package.Parent.Remote.target",
+            simple_name="target",
+            type="function",
+        )
+        remote.filename = Path("remote.py")
+        skylos.defs = {
+            local.name: local,
+            remote.name: remote,
+        }
+        skylos.refs = [("package.Parent.target", Path("local.py"))]
+        skylos._global_type_map = {}
+
+        skylos._mark_refs()
+
+        assert local.references == 1
+        assert remote.references == 0
+
+    def test_mark_refs_qualified_prefix_excludes_sibling_name_prefix(
+        self, skylos, mock_definition
+    ):
+        """`package.Parent` must not reach `package.Parents`.
+
+        The qualified lookup bounds its search at ``qualifier + "/"``, the code
+        point right after ``.``. A sibling whose name merely starts with the
+        same characters is not a dotted descendant and must stay unmatched.
+        """
+        sibling = mock_definition(
+            name="package.Parents.target",
+            simple_name="target",
+            type="function",
+        )
+        nested = mock_definition(
+            name="package.Parent.Nested.target",
+            simple_name="target",
+            type="function",
+        )
+        skylos.defs = {
+            sibling.name: sibling,
+            nested.name: nested,
+        }
+        skylos.refs = [("package.Parent.target", Path("caller.py"))]
+        skylos._global_type_map = {}
+
+        skylos._mark_refs()
+
+        assert nested.references == 1
+        assert sibling.references == 0
+
+    def test_mark_refs_qualified_prefix_leaves_three_way_ambiguity_unresolved(
+        self, skylos, mock_definition
+    ):
+        """More than two prefix matches stays ambiguous.
+
+        The qualified lookup stops collecting at two matches because callers
+        only distinguish zero / one / more-than-one. Truncation must not make
+        an unresolvable reference look resolvable.
+        """
+        definitions = []
+        for suffix, filename in (("A", "a.py"), ("B", "a.py"), ("C", "b.py")):
+            definition = mock_definition(
+                name=f"pkg.P.{suffix}.target",
+                simple_name="target",
+                type="function",
+            )
+            definition.filename = Path(filename)
+            definitions.append(definition)
+        skylos.defs = {d.name: d for d in definitions}
+        skylos.refs = [("pkg.P.target", Path("a.py"))]
+        skylos._global_type_map = {}
+
+        skylos._mark_refs()
+
+        assert [d.references for d in definitions] == [0, 0, 0]
+
+    def test_mark_refs_qualified_prefix_narrows_three_matches_by_file(
+        self, skylos, mock_definition
+    ):
+        """A unique same-file match wins even past the two-match cutoff."""
+        definitions = []
+        for suffix, filename in (("A", "a.py"), ("B", "b.py"), ("C", "c.py")):
+            definition = mock_definition(
+                name=f"pkg.P.{suffix}.target",
+                simple_name="target",
+                type="function",
+            )
+            definition.filename = Path(filename)
+            definitions.append(definition)
+        skylos.defs = {d.name: d for d in definitions}
+        skylos.refs = [("pkg.P.target", Path("c.py"))]
+        skylos._global_type_map = {}
+
+        skylos._mark_refs()
+
+        assert [d.references for d in definitions] == [0, 0, 1]
+
 
 class TestHeuristics:
     @pytest.fixture
@@ -706,6 +838,243 @@ class TestAnalyze:
         assert _architecture_iad_strict({"strict": True}) is False
         assert _architecture_iad_strict({"enforce_iad": True}) is True
         assert _architecture_iad_strict({"strict_iad": True}) is True
+
+    def test_init_explicit_all_only_keeps_declared_symbols_live(self, tmp_path):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            "from .core import public_reexport as package_api, stale_reexport\n\n"
+            '__all__ = ["LIVE_CONSTANT", "public_function", "package_api"]\n\n'
+            'LIVE_CONSTANT: str = "live"\n'
+            'DEAD_CONSTANT: str = "dead"\n\n'
+            "def public_function():\n"
+            "    return LIVE_CONSTANT\n\n"
+            "def dead_function():\n"
+            '    return "dead"\n',
+            encoding="utf-8",
+        )
+        (package / "core.py").write_text(
+            "def public_reexport():\n"
+            "    return 'public'\n\n"
+            "def stale_reexport():\n"
+            "    return 'stale'\n\n"
+            "def LIVE_CONSTANT():\n"
+            "    return 'same simple name in another module'\n",
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in (
+                "unused_functions",
+                "unused_variables",
+                "unused_imports",
+            )
+            for item in result.get(category, [])
+        }
+
+        assert ("__init__.py", "LIVE_CONSTANT") not in dead
+        assert ("__init__.py", "public_function") not in dead
+        assert ("__init__.py", "public_reexport") not in dead
+        assert ("core.py", "public_reexport") not in dead
+        assert ("__init__.py", "DEAD_CONSTANT") in dead
+        assert ("__init__.py", "dead_function") in dead
+        assert ("__init__.py", "stale_reexport") in dead
+        assert ("core.py", "LIVE_CONSTANT") in dead
+
+    def test_init_empty_explicit_all_exports_nothing(self, tmp_path):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            "__all__ = []\n\n"
+            "PUBLIC_LOOKING_CONSTANT = 'dead'\n\n"
+            "def public_looking_function():\n"
+            "    return 'dead'\n",
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in ("unused_functions", "unused_variables")
+            for item in result.get(category, [])
+        }
+
+        assert ("__init__.py", "PUBLIC_LOOKING_CONSTANT") in dead
+        assert ("__init__.py", "public_looking_function") in dead
+
+    def test_init_static_all_mutations_remain_authoritative(self, tmp_path):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            '__all__: list[str] = ["FIRST"]\n'
+            '__all__ += ("SECOND",)\n'
+            '__all__.append("third")\n'
+            '__all__.extend(["fourth"])\n\n'
+            'FIRST = "first"\n'
+            'SECOND = "second"\n\n'
+            "def third():\n"
+            '    return "third"\n\n'
+            "def fourth():\n"
+            '    return "fourth"\n\n'
+            "def stale():\n"
+            '    return "stale"\n',
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in ("unused_functions", "unused_variables")
+            for item in result.get(category, [])
+        }
+
+        assert ("__init__.py", "FIRST") not in dead
+        assert ("__init__.py", "SECOND") not in dead
+        assert ("__init__.py", "third") not in dead
+        assert ("__init__.py", "fourth") not in dead
+        assert ("__init__.py", "stale") in dead
+
+    def test_init_dynamic_all_mutation_falls_back_to_public_surface(self, tmp_path):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            'DYNAMIC_EXPORTS = ["maybe_exported"]\n'
+            '__all__ = ["declared"]\n'
+            "__all__.extend(DYNAMIC_EXPORTS)\n\n"
+            "def declared():\n"
+            '    return "declared"\n\n'
+            "def maybe_exported():\n"
+            '    return "maybe"\n\n'
+            "def public_because_surface_is_unknown():\n"
+            '    return "unknown"\n',
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in ("unused_functions", "unused_variables")
+            for item in result.get(category, [])
+        }
+
+        assert ("__init__.py", "declared") not in dead
+        assert ("__init__.py", "maybe_exported") not in dead
+        assert ("__init__.py", "public_because_surface_is_unknown") not in dead
+
+    def test_dynamic_all_preserves_observed_exports_in_regular_module(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'DYNAMIC_NAME = "maybe_exported"\n'
+            '__all__ = ["known"]\n'
+            "__all__.append(DYNAMIC_NAME)\n\n"
+            "def known():\n"
+            '    return "known"\n\n'
+            "def stale():\n"
+            '    return "stale"\n',
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in ("unused_functions", "unused_variables")
+            for item in result.get(category, [])
+        }
+
+        assert ("app.py", "known") not in dead
+        assert ("app.py", "stale") in dead
+
+    def test_external_init_reexport_does_not_rescue_unrelated_local_name(
+        self, tmp_path
+    ):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            'from external import foo\n\n__all__ = ["foo"]\n',
+            encoding="utf-8",
+        )
+        (package / "local.py").write_text(
+            "def foo():\n    return 'dead local symbol'\n",
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for item in result.get("unused_functions", [])
+        }
+
+        assert ("local.py", "foo") in dead
+
+    def test_init_without_explicit_all_remains_a_public_surface(self, tmp_path):
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            "PUBLIC_CONSTANT = 'public'\n\n"
+            "def public_function():\n"
+            "    return PUBLIC_CONSTANT\n",
+            encoding="utf-8",
+        )
+
+        result = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                grep_verify=False,
+                trace_file=False,
+            )
+        )
+        dead = {
+            (Path(item["file"]).name, item["simple_name"])
+            for category in ("unused_functions", "unused_variables")
+            for item in result.get(category, [])
+        }
+
+        assert ("__init__.py", "PUBLIC_CONSTANT") not in dead
+        assert ("__init__.py", "public_function") not in dead
 
     def test_package_subdir_scan_keeps_absolute_imports_live(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[tool.skylos]\n", encoding="utf-8")
@@ -1950,7 +2319,7 @@ class TestClass:
             project_root=scan_root,
         )
 
-        assert len(result) == 27
+        assert len(result) == 28
         assert result[0] == []
         assert result[19] == []
         assert result[25]["rule_id"] == "SKY-ANALYSIS-INCOMPLETE"
@@ -1966,7 +2335,7 @@ class TestClass:
 
         result = proc_file(str(source), "oversized", project_root=tmp_path)
 
-        assert len(result) == 27
+        assert len(result) == 28
         assert result[0] == []
         assert result[19] == []
         assert result[25]["kind"] == "source_read_error"
@@ -1986,7 +2355,7 @@ class TestClass:
 
         result = proc_file(str(source), "bounded", project_root=tmp_path)
 
-        assert len(result) == 27
+        assert len(result) == 28
         assert result[19] == [source_text]
         assert result[25] is None
 
@@ -2204,6 +2573,79 @@ class TestClass:
 
 
 class TestApplyPenalties:
+    def test_abstract_override_lookup_indexes_definitions_once(self, mock_definition):
+        class CountingDefinitions(dict):
+            def __init__(self, definitions):
+                super().__init__(definitions)
+                self.items_calls = 0
+                self.values_calls = 0
+
+            def items(self):
+                self.items_calls += 1
+                return super().items()
+
+            def values(self):
+                self.values_calls += 1
+                return super().values()
+
+        base_class = mock_definition(
+            name="models.Base", simple_name="Base", type="class"
+        )
+        base_method = mock_definition(
+            name="models.Base.render_report_segment",
+            simple_name="render_report_segment",
+            type="method",
+        )
+        child_class = mock_definition(
+            name="models.Child", simple_name="Child", type="class"
+        )
+        child_class.base_classes = ["models.Base"]
+        child_method = mock_definition(
+            name="models.Child.render_report_segment",
+            simple_name="render_report_segment",
+            type="method",
+        )
+        external_class = mock_definition(
+            name="models.ExternalChild", simple_name="ExternalChild", type="class"
+        )
+        external_class.base_classes = ["framework.ExternalBase"]
+        external_methods = [
+            mock_definition(
+                name=f"models.ExternalChild.external_hook_{index}",
+                simple_name=f"external_hook_{index}",
+                type="method",
+            )
+            for index in range(2)
+        ]
+        definitions = CountingDefinitions(
+            {
+                definition.name: definition
+                for definition in (
+                    base_class,
+                    base_method,
+                    child_class,
+                    child_method,
+                    external_class,
+                    *external_methods,
+                )
+            }
+        )
+        analyzer = Skylos()
+        analyzer.defs = definitions
+        analyzer._global_abstract_methods = {}
+        analyzer._global_protocol_classes = set()
+        framework = Mock()
+        framework.abstract_methods = {}
+        framework.protocol_classes = set()
+
+        assert _check_abstract_overrides(child_method, analyzer, framework) is True
+        assert child_method.suppression_code == "parent_override"
+        for method in external_methods:
+            assert _check_abstract_overrides(method, analyzer, framework) == -40
+
+        assert definitions.values_calls == 1
+        assert definitions.items_calls == 0
+
     @pytest.mark.parametrize(
         ("filename", "def_type", "expected_reason"),
         [
