@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skylos.core.python_api_surface import PythonApiSurfaceCacheSession
 from skylos.analysis.ast_cache import (
     MODE_SAFE_IGNORE_1MB,
     load_python_module,
     load_python_source,
 )
+from skylos.core.python_api_surface import PythonApiSurfaceCacheSession
 
 RULE_ID_API_SIGNATURE = "SKY-D224"
 SEV_HIGH = "HIGH"

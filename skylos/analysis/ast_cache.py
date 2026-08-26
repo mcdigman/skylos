@@ -17,8 +17,8 @@ the trees stored here.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from skylos.core.safe_cache_io import read_text_no_symlink
 

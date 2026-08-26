@@ -1284,7 +1284,9 @@ def _build_ast_index(tree):
         else:
             child_chain = chain
 
-        decorators = getattr(node, "decorator_list", None) if is_function_scope else None
+        decorators = (
+            getattr(node, "decorator_list", None) if is_function_scope else None
+        )
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.Attribute, ast.Call)):
                 parent_map[child] = node
