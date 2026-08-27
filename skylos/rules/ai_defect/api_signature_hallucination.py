@@ -11,6 +11,7 @@ from skylos.analysis.ast_cache import (
     MODE_SAFE_IGNORE_1MB,
     load_python_module,
     load_python_source,
+    mode_max_bytes,
 )
 from skylos.core.python_api_surface import PythonApiSurfaceCacheSession
 
@@ -20,7 +21,7 @@ DEFAULT_API_SIGNATURE_ALLOWLIST = ("requests", "pandas", "boto3", "openai")
 VIBE_CATEGORY = "api_signature_hallucination"
 AI_LIKELIHOOD = "high"
 # Source-size cap enforced by ast_cache's MODE_SAFE_IGNORE_1MB read mode.
-MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES = 1_000_000
+MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES = mode_max_bytes(MODE_SAFE_IGNORE_1MB)
 _MAX_API_SIGNATURE_PREFILTER_ROOTS = 64
 
 SurfaceLoader = Callable[[str | Path, str], dict[str, Any] | None]

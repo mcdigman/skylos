@@ -41,7 +41,11 @@ from skylos.visitors.languages.typescript.analysis import (
     find_dead_ts_files,
     find_unused_ts_exports,
 )
-from skylos.analysis.ast_cache import clear_python_ast_cache
+from skylos.analysis.ast_cache import (
+    MODE_IGNORE,
+    clear_python_ast_cache,
+    load_python_module,
+)
 from skylos.visitors.languages.go import clear_go_cache
 
 from skylos.rules.secrets import (
@@ -2762,7 +2766,18 @@ class Skylos:
             analysis_errors=analysis_errors,
         )
 
-    def analyze(
+    def analyze(self, *args, **kwargs) -> str:
+        """Run one analysis, releasing the run-scoped AST cache when it ends.
+
+        ``_analyze`` clears the cache on entry too, so a run always starts
+        from a clean cache even if a previous one died part-way.
+        """
+        try:
+            return self._analyze(*args, **kwargs)
+        finally:
+            clear_python_ast_cache()
+
+    def _analyze(
         self,
         path,
         thr=60,
@@ -4088,11 +4103,12 @@ class Skylos:
                             PhantomDecoratorRule(vibe_dictionary=vibe_dictionary)
                         )
                     for py_file in _ai_py_files:
-                        source = Path(py_file).read_text(
-                            encoding="utf-8",
-                            errors="ignore",
+                        source, tree = load_python_module(
+                            Path(py_file),
+                            MODE_IGNORE,
                         )
-                        tree = ast.parse(source)
+                        if tree is None:
+                            continue
                         linter = LinterVisitor(fallback_rules, str(py_file))
                         linter.context["source"] = source
                         linter.visit(tree)
@@ -4651,30 +4667,27 @@ def analyze(
     required_config_rules=None,
     grep_cache=True,
 ) -> str:
-    try:
-        return Skylos().analyze(
-            path,
-            thr=conf,
-            exclude_folders=exclude_folders,
-            enable_secrets=enable_secrets,
-            enable_danger=enable_danger,
-            enable_quality=enable_quality,
-            enable_ai_defects=enable_ai_defects,
-            enable_dependency_hallucinations=enable_dependency_hallucinations,
-            extra_visitors=extra_visitors,
-            progress_callback=progress_callback,
-            custom_rules_data=custom_rules_data,
-            changed_files=changed_files,
-            grep_verify=grep_verify,
-            grep_cache=grep_cache,
-            enable_sca=enable_sca,
-            trace_file=trace_file,
-            config_file=config_file,
-            project_config_overrides=project_config_overrides,
-            required_config_rules=required_config_rules,
-        )
-    finally:
-        clear_python_ast_cache()
+    return Skylos().analyze(
+        path,
+        thr=conf,
+        exclude_folders=exclude_folders,
+        enable_secrets=enable_secrets,
+        enable_danger=enable_danger,
+        enable_quality=enable_quality,
+        enable_ai_defects=enable_ai_defects,
+        enable_dependency_hallucinations=enable_dependency_hallucinations,
+        extra_visitors=extra_visitors,
+        progress_callback=progress_callback,
+        custom_rules_data=custom_rules_data,
+        changed_files=changed_files,
+        grep_verify=grep_verify,
+        grep_cache=grep_cache,
+        enable_sca=enable_sca,
+        trace_file=trace_file,
+        config_file=config_file,
+        project_config_overrides=project_config_overrides,
+        required_config_rules=required_config_rules,
+    )
 
 
 if __name__ == "__main__":

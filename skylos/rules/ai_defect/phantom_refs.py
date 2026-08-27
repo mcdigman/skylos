@@ -526,26 +526,62 @@ def _bare_name_is_bound(name, node, tree, ast_index, scope_infos):
     return False
 
 
+_RESEMBLANCE_THRESHOLD = 0.82
+_RESEMBLANCE_INDEX_CACHE: dict[int, tuple[set, dict[str, int], dict[int, list]]] = {}
+
+
+def _resemblance_index(repo_member_names):
+    """(trailing-token counts, candidates by length) for the member names.
+
+    Both views are derived once per member-name set: the token counts answer
+    the shared-trailing-token half of the test without touching every
+    candidate, and the length buckets let the similarity half skip whole
+    buckets that cannot reach the threshold.
+    """
+    entry = _RESEMBLANCE_INDEX_CACHE.get(id(repo_member_names))
+    if entry is None or entry[0] is not repo_member_names:
+        token_counts: dict[str, int] = {}
+        by_length: dict[int, list] = {}
+        for candidate in repo_member_names:
+            if "_" in candidate:
+                tail = candidate.rsplit("_", 1)[1]
+                token_counts[tail] = token_counts.get(tail, 0) + 1
+            by_length.setdefault(len(candidate), []).append(candidate)
+        entry = (repo_member_names, token_counts, by_length)
+        _RESEMBLANCE_INDEX_CACHE[id(repo_member_names)] = entry
+    return entry[1], entry[2]
+
+
+register_dependent_clear(_RESEMBLANCE_INDEX_CACHE.clear)
+
+
 def _resembles_local_symbol(name, repo_member_names):
-    for candidate in repo_member_names:
-        if candidate == name:
+    token_counts, by_length = _resemblance_index(repo_member_names)
+
+    if "_" in name:
+        tail = name.rsplit("_", 1)[1]
+        sharing = token_counts.get(tail, 0)
+        if name in repo_member_names:
+            sharing -= 1
+        if sharing > 0:
+            return True
+
+    length = len(name)
+    for candidate_length, candidates in by_length.items():
+        # SequenceMatcher.ratio() can never exceed real_quick_ratio(), which
+        # is 2 * min(la, lb) / (la + lb), so whole length buckets are out of
+        # reach of the threshold without comparing a single character.
+        if 2 * min(length, candidate_length) < _RESEMBLANCE_THRESHOLD * (
+            length + candidate_length
+        ):
             continue
-        if _shared_suffix_token(name, candidate):
-            return True
-        similarity = SequenceMatcher(None, name, candidate).ratio()
-        if similarity >= 0.82:
-            return True
+        for candidate in candidates:
+            if candidate == name:
+                continue
+            similarity = SequenceMatcher(None, name, candidate).ratio()
+            if similarity >= _RESEMBLANCE_THRESHOLD:
+                return True
     return False
-
-
-def _shared_suffix_token(left, right):
-    left_parts = left.split("_")
-    right_parts = right.split("_")
-    if len(left_parts) < 2:
-        return False
-    if len(right_parts) < 2:
-        return False
-    return left_parts[-1] == right_parts[-1]
 
 
 def _decorator_target(decorator):
@@ -575,7 +611,48 @@ def _module_name(root: Path, file_path: Path) -> str:
     return ".".join(parts)
 
 
+_MODULE_FACTS_CACHE: dict[tuple, tuple[frozenset, "_ModuleFacts"]] = {}
+
+
 def _collect_module_facts(
+    tree,
+    current_module,
+    local_modules,
+    *,
+    source_has_type_checking=None,
+    include_reference_context=False,
+):
+    """Memoized ``_build_module_facts``, shared across rule passes.
+
+    The phantom-ref scan and the API hallucination coverage pass collect
+    identical facts for the same tree and module. Keyed by id(tree) (trees
+    are held by the run-scoped AST cache, which clears this); the returned
+    facts are only ever read by callers, never mutated.
+    """
+    key = (
+        id(tree),
+        current_module,
+        source_has_type_checking,
+        include_reference_context,
+    )
+    cached = _MODULE_FACTS_CACHE.get(key)
+    if cached is not None and cached[0] == local_modules:
+        return cached[1]
+    facts = _build_module_facts(
+        tree,
+        current_module,
+        local_modules,
+        source_has_type_checking=source_has_type_checking,
+        include_reference_context=include_reference_context,
+    )
+    _MODULE_FACTS_CACHE[key] = (frozenset(local_modules), facts)
+    return facts
+
+
+register_dependent_clear(_MODULE_FACTS_CACHE.clear)
+
+
+def _build_module_facts(
     tree,
     current_module,
     local_modules,
@@ -1179,7 +1256,22 @@ def _is_irrefutable_match_case(case):
     )
 
 
+_POSTPONED_ANNOTATION_CACHE: dict[int, set[int]] = {}
+
+
 def _postponed_annotation_node_ids(tree):
+    """Memoized per tree; both rule passes ask for the same tree's ids."""
+    node_ids = _POSTPONED_ANNOTATION_CACHE.get(id(tree))
+    if node_ids is None:
+        node_ids = _build_postponed_annotation_node_ids(tree)
+        _POSTPONED_ANNOTATION_CACHE[id(tree)] = node_ids
+    return node_ids
+
+
+register_dependent_clear(_POSTPONED_ANNOTATION_CACHE.clear)
+
+
+def _build_postponed_annotation_node_ids(tree):
     if not _uses_future_annotations(tree):
         return set()
 
@@ -1287,13 +1379,26 @@ def _build_ast_index(tree):
         decorators = (
             getattr(node, "decorator_list", None) if is_function_scope else None
         )
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.Attribute, ast.Call)):
-                parent_map[child] = node
-            if decorators and child in decorators:
-                todo.append((child, chain))
+        # Inlined ast.iter_child_nodes: this runs once per node of every
+        # module in the repo, and the two generator frames it saves are a
+        # measurable share of the index build.
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if isinstance(value, ast.AST):
+                children = (value,)
+            elif type(value) is list:
+                children = value
             else:
-                todo.append((child, child_chain))
+                continue
+            for child in children:
+                if not isinstance(child, ast.AST):
+                    continue
+                if isinstance(child, (ast.Attribute, ast.Call)):
+                    parent_map[child] = node
+                if decorators and child in decorators:
+                    todo.append((child, chain))
+                else:
+                    todo.append((child, child_chain))
 
     return _ModuleAstIndex(
         parent_map=parent_map,
@@ -1322,7 +1427,11 @@ def _scope_infos_for(tree, current_module, local_modules):
     ):
         return cached[2]
     scope_infos = _build_scope_infos(tree, current_module, local_modules)
-    _SCOPE_INFOS_CACHE[id(tree)] = (current_module, local_modules, scope_infos)
+    _SCOPE_INFOS_CACHE[id(tree)] = (
+        current_module,
+        frozenset(local_modules),
+        scope_infos,
+    )
     return scope_infos
 
 

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from skylos.analysis.ast_cache import MODE_SAFE_REPLACE_2MB, load_python_module
+from skylos.analysis.ast_cache import (
+    MODE_SAFE_REPLACE_2MB,
+    load_python_module,
+    register_dependent_clear,
+)
 from skylos.rules.ai_defect.phantom_refs import (
     _ast_index_for,
     _scope_infos_for,
@@ -355,12 +359,36 @@ def _inspect_module_import(
             state.skip("local_import_outside_scan")
 
 
+_LOCAL_PREFIX_CACHE: dict[int, tuple[set[str], set[str]]] = {}
+
+
+def _local_module_prefixes(local_modules: set[str]) -> set[str]:
+    """Every proper dotted prefix of every local module, built once."""
+    entry = _LOCAL_PREFIX_CACHE.get(id(local_modules))
+    if entry is None or entry[0] is not local_modules:
+        prefixes: set[str] = set()
+        for candidate in local_modules:
+            parts = candidate.split(".")
+            for index in range(1, len(parts)):
+                prefixes.add(".".join(parts[:index]))
+        entry = (local_modules, prefixes)
+        _LOCAL_PREFIX_CACHE[id(local_modules)] = entry
+    return entry[1]
+
+
+register_dependent_clear(_LOCAL_PREFIX_CACHE.clear)
+
+
 def _has_local_module_prefix(module_name: str, local_modules: set[str]) -> bool:
-    return any(
-        module_name.startswith(f"{candidate}.")
-        or candidate.startswith(f"{module_name}.")
-        for candidate in local_modules
-    )
+    # "some local module is a package prefix of module_name" is a lookup over
+    # module_name's own dotted prefixes; "module_name is a package prefix of
+    # some local module" is a lookup in the precomputed prefix set. Both
+    # replace a scan of every local module per call.
+    parts = module_name.split(".")
+    for index in range(1, len(parts)):
+        if ".".join(parts[:index]) in local_modules:
+            return True
+    return module_name in _local_module_prefixes(local_modules)
 
 
 def _local_module_exists(root: Path, module_name: str) -> bool:
