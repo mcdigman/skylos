@@ -10,6 +10,7 @@ from skylos.analysis.ast_cache import (
     MODE_SAFE_REPLACE_2MB,
     load_python_module,
     register_dependent_clear,
+    releases_python_ast_cache,
 )
 from skylos.rules.ai_defect.phantom_refs import (
     _ast_index_for,
@@ -45,6 +46,7 @@ class _PythonCoverageState:
         self.reasons[reason] += 1
 
 
+@releases_python_ast_cache
 def scan_python_local_api_hallucinations(
     project_root: str | Path,
     py_files: Iterable[str | Path],

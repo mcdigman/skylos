@@ -12,6 +12,7 @@ from skylos.analysis.ast_cache import (
     load_python_module,
     load_python_source,
     mode_max_bytes,
+    releases_python_ast_cache,
 )
 from skylos.core.python_api_surface import PythonApiSurfaceCacheSession
 
@@ -333,6 +334,7 @@ class _ApiSignatureChecker(ast.NodeVisitor):
         self.findings.append(_finding(self.file_path, node, target.label, message))
 
 
+@releases_python_ast_cache
 def scan_python_api_signature_hallucinations(
     repo_root: str | Path | None,
     py_files: list[Path],

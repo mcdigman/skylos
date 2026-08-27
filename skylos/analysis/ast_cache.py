@@ -11,18 +11,22 @@ identical (the common case of a regular, valid-UTF-8 file).
 Equal sources are pooled per path, so a file read under several modes
 costs one string rather than one per mode.
 
-The cache is cleared at the start and end of each analyzer run. Entries
-are also dropped when a file's (mtime, size) changes, so a caller that
-enters a rule pass directly, without going through the analyzer, never
-sees a source that has since been edited on disk. Derived per-tree caches
-can register a clear callback so their id(tree)-keyed entries never
-outlive the trees stored here.
+Lifetime is a session. Every entry point that populates the cache -- the
+analyzer run and each public rule scanner -- runs inside one, and the
+outermost session clears on the way out, so nothing outlives the call the
+caller made. Sessions nest, so a scanner called from the analyzer still
+shares the run's cache instead of dropping it early. Within a session,
+entries are dropped when a file's identity changes. Derived per-tree
+caches can register a clear callback so their id(tree)-keyed entries
+never outlive the trees stored here.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from skylos.core.safe_cache_io import read_text_no_symlink
@@ -45,8 +49,9 @@ _MISSING = object()
 _sources: dict[tuple[str, str], str | None] = {}
 _trees: dict[str, dict[str, ast.Module | None]] = {}
 _source_pool: dict[str, dict[str, str]] = {}
-_path_tokens: dict[str, tuple[int, int] | None] = {}
+_path_tokens: dict[str, tuple | None] = {}
 _dependent_clears: list[Callable[[], None]] = []
+_session_depth = 0
 
 
 def mode_max_bytes(mode: str) -> int | None:
@@ -75,13 +80,24 @@ def _read_source(path: Path, mode: str) -> str | None:
     return read_text_no_symlink(path, encoding="utf-8", **safe_args)
 
 
-def _path_token(path: Path) -> tuple[int, int] | None:
-    """Identity of the file at ``path``, or None when it cannot be stat-ed."""
+def _path_token(path: Path) -> tuple | None:
+    """Identity of the file at ``path``, or None when it cannot be stat-ed.
+
+    Includes st_ctime_ns so that a rewrite whose size and mtime are then
+    restored -- what ``cp -p``, ``rsync -t`` and a test calling os.utime
+    all do -- is still seen as a change.
+    """
     try:
         stat_result = path.stat()
     except OSError:
         return None
-    return stat_result.st_mtime_ns, stat_result.st_size
+    return (
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        stat_result.st_size,
+        stat_result.st_ino,
+        stat_result.st_dev,
+    )
 
 
 def _drop_path(key: str) -> None:
@@ -147,6 +163,35 @@ def register_dependent_clear(callback: Callable[[], None]) -> None:
     """
     if callback not in _dependent_clears:
         _dependent_clears.append(callback)
+
+
+@contextmanager
+def python_ast_cache_session() -> Iterator[None]:
+    """Scope the cache to this block.
+
+    Sessions nest and only the outermost one clears, so a rule pass entered
+    directly releases everything it cached on the way out, while the same
+    pass nested inside an analyzer run keeps sharing with the rest of it.
+    """
+    global _session_depth
+    _session_depth += 1
+    try:
+        yield
+    finally:
+        _session_depth -= 1
+        if _session_depth == 0:
+            clear_python_ast_cache()
+
+
+def releases_python_ast_cache(func):
+    """Run ``func`` inside a cache session, preserving its signature."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with python_ast_cache_session():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def clear_python_ast_cache() -> None:

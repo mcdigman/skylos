@@ -45,6 +45,7 @@ from skylos.analysis.ast_cache import (
     MODE_IGNORE,
     clear_python_ast_cache,
     load_python_module,
+    releases_python_ast_cache,
 )
 from skylos.visitors.languages.go import clear_go_cache
 
@@ -2766,18 +2767,8 @@ class Skylos:
             analysis_errors=analysis_errors,
         )
 
-    def analyze(self, *args, **kwargs) -> str:
-        """Run one analysis, releasing the run-scoped AST cache when it ends.
-
-        ``_analyze`` clears the cache on entry too, so a run always starts
-        from a clean cache even if a previous one died part-way.
-        """
-        try:
-            return self._analyze(*args, **kwargs)
-        finally:
-            clear_python_ast_cache()
-
-    def _analyze(
+    @releases_python_ast_cache
+    def analyze(
         self,
         path,
         thr=60,

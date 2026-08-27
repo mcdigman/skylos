@@ -11,6 +11,7 @@ from skylos.analysis.ast_cache import (
     MODE_REPLACE,
     load_python_module,
     register_dependent_clear,
+    releases_python_ast_cache,
 )
 from skylos.analysis.control_flow import _parse_requires_python
 from skylos.rules.quality._protocols import (
@@ -94,6 +95,7 @@ class _ModuleFacts:
     type_checking_node_ids: set[int]
 
 
+@releases_python_ast_cache
 def scan_repo_phantom_security_references(
     project_root, py_files, target_files=None, vibe_dictionary=None
 ):
@@ -628,13 +630,21 @@ def _collect_module_facts(
     identical facts for the same tree and module. Keyed by id(tree) (trees
     are held by the run-scoped AST cache, which clears this); the returned
     facts are only ever read by callers, never mutated.
+
+    Only the reference-context result is memoized: that is the one both
+    passes ask for. The plain result is built once per module -- the
+    phantom scan's _ensure_module_loaded guards it -- so caching it would
+    hold a second full set of module facts that nothing ever reads again.
     """
-    key = (
-        id(tree),
-        current_module,
-        source_has_type_checking,
-        include_reference_context,
-    )
+    if not include_reference_context:
+        return _build_module_facts(
+            tree,
+            current_module,
+            local_modules,
+            source_has_type_checking=source_has_type_checking,
+        )
+
+    key = (id(tree), current_module, source_has_type_checking)
     cached = _MODULE_FACTS_CACHE.get(key)
     if cached is not None and cached[0] == local_modules:
         return cached[1]
@@ -643,7 +653,7 @@ def _collect_module_facts(
         current_module,
         local_modules,
         source_has_type_checking=source_has_type_checking,
-        include_reference_context=include_reference_context,
+        include_reference_context=True,
     )
     _MODULE_FACTS_CACHE[key] = (frozenset(local_modules), facts)
     return facts
