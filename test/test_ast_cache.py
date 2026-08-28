@@ -2,6 +2,7 @@ import ast
 import inspect
 import json
 import os
+import pathlib
 
 import pytest
 
@@ -21,6 +22,7 @@ from skylos.analysis.ast_cache import (
 )
 from skylos.analyzer import Skylos
 from skylos.deadcode.python_ast import parse_python_files
+from skylos.reporting.architecture_result import _architecture_module_trees
 from skylos.rules.ai_defect import phantom_refs
 from skylos.rules.ai_defect.api_signature_hallucination import (
     MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES,
@@ -278,3 +280,54 @@ def test_parse_python_files_shares_trees_inside_an_open_session(tmp_path):
         assert ast_cache._trees
 
     assert not ast_cache._trees
+
+
+def test_an_analyze_nested_in_a_session_does_not_wipe_it(tmp_path):
+    path = _write(tmp_path / "module.py", "x = 1\n")
+
+    with python_ast_cache_session():
+        _, tree = load_python_module(path, MODE_REPLACE)
+        Skylos().analyze(str(tmp_path))
+        assert load_python_module(path, MODE_REPLACE)[1] is tree
+
+    assert not ast_cache._trees
+
+
+def test_the_outermost_session_starts_from_a_clean_cache(tmp_path):
+    path = _write(tmp_path / "module.py", "x = 1\n")
+    load_python_module(path, MODE_REPLACE)
+    assert ast_cache._trees
+
+    with python_ast_cache_session():
+        assert not ast_cache._trees
+
+
+def test_the_import_findings_fallback_does_not_memoize_a_foreign_tree():
+    tree = ast.parse("import os\n")
+
+    phantom_refs._direct_local_import_findings(
+        pathlib.Path("x.py"),
+        "m",
+        tree,
+        set(),
+        {},
+        {},
+        set(),
+        set(),
+        set(),
+        set(),
+        lambda name: False,
+    )
+
+    assert not phantom_refs._AST_INDEX_CACHE
+
+
+def test_architecture_module_trees_reuse_the_session_cache(tmp_path):
+    root = tmp_path.resolve()
+    path = _write(root / "module.py", "x = 1\n")
+
+    with python_ast_cache_session():
+        _, tree = load_python_module(path, MODE_IGNORE)
+        assert _architecture_module_trees([path], {path: "m"}, {})["m"] is tree
+
+    assert _architecture_module_trees([path], {path: "m"}, {"m": 0.5}) == {}

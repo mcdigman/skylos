@@ -43,7 +43,6 @@ from skylos.visitors.languages.typescript.analysis import (
 )
 from skylos.analysis.ast_cache import (
     MODE_IGNORE,
-    clear_python_ast_cache,
     load_python_module,
     releases_python_ast_cache,
 )
@@ -2801,7 +2800,6 @@ class Skylos:
             self._reset_run_state()
         self._has_analyzed = True
         clear_go_cache()
-        clear_python_ast_cache()
         self._sca_coverage = None
 
         raw_first = Path(

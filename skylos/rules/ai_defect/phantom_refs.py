@@ -429,7 +429,10 @@ def _direct_local_import_findings(
 ):
     findings = []
     if ast_index is None:
-        ast_index = _ast_index_for(tree)
+        # Built, not memoized: a caller reaching this fallback may hand us a
+        # tree the run-scoped cache does not hold, and an id(tree)-keyed
+        # entry for it could outlive the tree.
+        ast_index = _build_ast_index(tree)
     for node in ast_index.import_nodes:
         if not isinstance(node, ast.ImportFrom):
             continue

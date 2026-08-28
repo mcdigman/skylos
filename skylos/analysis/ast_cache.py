@@ -19,6 +19,12 @@ shares the run's cache instead of dropping it early. Within a session,
 entries are dropped when a file's identity changes. Derived per-tree
 caches can register a clear callback so their id(tree)-keyed entries
 never outlive the trees stored here.
+
+Not thread-safe: the caches and the session depth are plain module
+globals, so sessions must not overlap across threads -- two entry points
+running concurrently would clear each other's live entries. Skylos'
+own file-level parallelism is process-based, and every caller of these
+entry points is single-threaded.
 """
 
 from __future__ import annotations
@@ -169,11 +175,14 @@ def register_dependent_clear(callback: Callable[[], None]) -> None:
 def python_ast_cache_session() -> Iterator[None]:
     """Scope the cache to this block.
 
-    Sessions nest and only the outermost one clears, so a rule pass entered
-    directly releases everything it cached on the way out, while the same
-    pass nested inside an analyzer run keeps sharing with the rest of it.
+    Sessions nest and only the outermost one clears -- on the way in as
+    well as on the way out -- so a rule pass entered directly starts clean
+    and releases everything it cached, while the same pass nested inside an
+    analyzer run neither inherits stale entries nor drops the run's.
     """
     global _session_depth
+    if _session_depth == 0:
+        clear_python_ast_cache()
     _session_depth += 1
     try:
         yield

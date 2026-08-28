@@ -428,6 +428,9 @@ def _parse_python_file(
     ):
         return None
 
+    # Deliberately a second call rather than one load_python_module above:
+    # the prefilter rejects most files, and asking for the module up front
+    # would parse every one of them to save a cached-source lookup.
     _, tree = load_python_module(resolved, MODE_SAFE_IGNORE_1MB)
     return tree
 
