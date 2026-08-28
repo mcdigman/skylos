@@ -20,6 +20,7 @@ from skylos.analysis.ast_cache import (
     register_dependent_clear,
 )
 from skylos.analyzer import Skylos
+from skylos.deadcode.python_ast import parse_python_files
 from skylos.rules.ai_defect import phantom_refs
 from skylos.rules.ai_defect.api_signature_hallucination import (
     MAX_PYTHON_API_SIGNATURE_SOURCE_BYTES,
@@ -252,3 +253,28 @@ def test_analyze_keeps_its_explicit_public_signature():
         parameter.kind is parameter.VAR_KEYWORD for parameter in parameters.values()
     )
     assert Skylos.analyze.__name__ == "analyze"
+
+
+def test_parse_python_files_releases_the_cache_but_keeps_its_result(tmp_path):
+    first = _write(tmp_path / "a.py", "x = 1\n")
+    second = _write(tmp_path / "b.py", "y = 2\n")
+
+    parsed = parse_python_files([first, second])
+
+    assert [entry.path for entry in parsed] == [first, second]
+    assert all(isinstance(entry.tree, ast.Module) for entry in parsed)
+    assert not ast_cache._sources
+    assert not ast_cache._trees
+    assert not ast_cache._source_pool
+
+
+def test_parse_python_files_shares_trees_inside_an_open_session(tmp_path):
+    path = _write(tmp_path / "a.py", "x = 1\n")
+
+    with python_ast_cache_session():
+        _, tree = load_python_module(path, MODE_STRICT)
+        parsed = parse_python_files([path])
+        assert parsed[0].tree is tree
+        assert ast_cache._trees
+
+    assert not ast_cache._trees
