@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: mcdigman/liveness_primer
-          ref: d6f3118a2cfc465426500eab449005fe56845c58 # v0.1.0
+          ref: ab692029310d41d597d0d151ddea4a20a2b4f2dd # main
           path: _liveness_primer
           persist-credentials: false
 
@@ -65,6 +65,7 @@ jobs:
             --old "$BASE_SHA" \
             --new "$MERGE_SHA" \
             --all \
+            --container \
             --output github \
             --json-out "$REPORT_JSON" \
             --jobs 2 \
