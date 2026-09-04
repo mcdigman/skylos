@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
 
+env:
+  LIVENESS_PRIMER_REF: ab692029310d41d597d0d151ddea4a20a2b4f2dd
+
 concurrency:
   group: liveness-primer-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -28,7 +31,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: mcdigman/liveness_primer
-          ref: ab692029310d41d597d0d151ddea4a20a2b4f2dd # main
+          ref: ${{ env.LIVENESS_PRIMER_REF }} # main
           path: _liveness_primer
           persist-credentials: false
 
@@ -38,6 +41,48 @@ jobs:
           version: "0.12.5"
           python-version: "3.13"
           enable-cache: false
+
+      - name: Compute exact container cache key
+        id: container-cache-key
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for revision in "$BASE_SHA" "$MERGE_SHA" "$LIVENESS_PRIMER_REF"; do
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid cache-key revision" >&2
+              exit 1
+            fi
+          done
+
+          docker_identity="docker $(docker version --format '{{.Server.Version}}')"
+          docker_hash="$(printf '%s' "$docker_identity" | sha256sum | cut -d ' ' -f 1)"
+          cache_key="liveness-primer-container-pair-v1-${RUNNER_OS}-${RUNNER_ARCH}-${docker_hash}-${LIVENESS_PRIMER_REF}-${BASE_SHA}-${MERGE_SHA}"
+          printf 'key=%s\n' "$cache_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore exact container environments
+        id: container-image-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
+          key: ${{ steps.container-cache-key.outputs.key }}
+
+      - name: Load cached container environments
+        if: steps.container-image-cache.outputs.cache-hit == 'true'
+        env:
+          IMAGE_ARCHIVE: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -L "$IMAGE_ARCHIVE" || ! -f "$IMAGE_ARCHIVE" ]]; then
+            echo "Cached container archive is not a regular file" >&2
+            exit 1
+          fi
+          docker load --input "$IMAGE_ARCHIVE"
 
       - name: Compare base with the pull request merge result
         env:
@@ -73,6 +118,48 @@ jobs:
             | tee "$REPORT_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
 
           test -s "$REPORT_JSON"
+
+      - name: Export container environments after a cache miss
+        if: steps.container-image-cache.outputs.cache-hit != 'true'
+        env:
+          IMAGE_ARCHIVE: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
+          REPORT_JSON: liveness-primer-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_fingerprint="$(jq -er '.manifest.base.fingerprint | select(test("^[0-9a-f]{24}$"))' "$REPORT_JSON")"
+          head_fingerprint="$(jq -er '.manifest.head.fingerprint | select(test("^[0-9a-f]{24}$"))' "$REPORT_JSON")"
+          base_image="liveness-primer/env:${base_fingerprint}"
+          head_image="liveness-primer/env:${head_fingerprint}"
+
+          docker image inspect "$base_image" "$head_image" > /dev/null
+
+          cache_dir="$(dirname "$IMAGE_ARCHIVE")"
+          if [[ -L "$cache_dir" || ( -e "$cache_dir" && ! -d "$cache_dir" ) ]]; then
+            echo "Container cache path is not a regular directory" >&2
+            exit 1
+          fi
+          mkdir -p "$cache_dir"
+          if [[ -L "$cache_dir" || ! -d "$cache_dir" ]]; then
+            echo "Container cache path is not a regular directory" >&2
+            exit 1
+          fi
+
+          temporary_archive="${IMAGE_ARCHIVE}.tmp"
+          if [[ -e "$temporary_archive" || -L "$temporary_archive" ]]; then
+            echo "Temporary container archive path already exists" >&2
+            exit 1
+          fi
+          docker save --output "$temporary_archive" "$base_image" "$head_image"
+          mv "$temporary_archive" "$IMAGE_ARCHIVE"
+
+      - name: Save exact container environments
+        if: success() && steps.container-image-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
+          key: ${{ steps.container-cache-key.outputs.key }}
 
       - name: Upload blast-radius evidence
         if: always()
