@@ -86,7 +86,7 @@ jobs:
 
       - name: Compare base with the pull request merge result
         env:
-          SKYLOS_REPOSITORY: https://github.com/duriantaco/skylos
+          SKYLOS_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # The base repository owns this synthetic merge commit, including
           # for fork PRs, so the comparison tests what would actually land.
