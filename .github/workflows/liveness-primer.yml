@@ -120,7 +120,8 @@ jobs:
           test -s "$REPORT_JSON"
 
       - name: Export container environments after a cache miss
-        if: steps.container-image-cache.outputs.cache-hit != 'true'
+        id: export-container-environments
+        if: always() && steps.container-image-cache.outputs.cache-hit != 'true'
         env:
           IMAGE_ARCHIVE: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
           REPORT_JSON: liveness-primer-report.json
@@ -128,6 +129,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          jq -e '.manifest.isolation_enforced == true and .manifest.comparable == true' "$REPORT_JSON" > /dev/null
           base_fingerprint="$(jq -er '.manifest.base.fingerprint | select(test("^[0-9a-f]{24}$"))' "$REPORT_JSON")"
           head_fingerprint="$(jq -er '.manifest.head.fingerprint | select(test("^[0-9a-f]{24}$"))' "$REPORT_JSON")"
           base_image="liveness-primer/env:${base_fingerprint}"
@@ -155,7 +157,7 @@ jobs:
           mv "$temporary_archive" "$IMAGE_ARCHIVE"
 
       - name: Save exact container environments
-        if: success() && steps.container-image-cache.outputs.cache-hit != 'true'
+        if: always() && steps.container-image-cache.outputs.cache-hit != 'true' && steps.export-container-environments.outcome == 'success'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/liveness-primer-image-cache/pair.tar
