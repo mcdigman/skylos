@@ -152,7 +152,7 @@ jobs:
             --container \
             --output github \
             --json-out "$REPORT_JSON" \
-            --jobs 1 \
+            --jobs 3 \
             --timeout 300 \
             | tee "$REPORT_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
 
