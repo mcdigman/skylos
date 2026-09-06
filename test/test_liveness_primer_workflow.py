@@ -151,7 +151,7 @@ def test_liveness_primer_workflow_uses_locked_comparison_contract():
     assert "--container" in script
     assert "--output github" in script
     assert '--json-out "$REPORT_JSON"' in script
-    assert "--jobs 2" in script
+    assert "--jobs 1" in script
     assert "--timeout 300" in script
     assert "set -euo pipefail" in script
     assert '| tee "$REPORT_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"' in script
