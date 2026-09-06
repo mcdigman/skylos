@@ -135,7 +135,6 @@ def test_liveness_primer_workflow_uses_locked_comparison_contract():
         "SKYLOS_GO_BIN": (
             "${{ format('{0}/skylos-go-engine/skylos-go', runner.temp) }}"
         ),
-        "SKYLOS_JOBS": "1",
         "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
         "MERGE_SHA": "${{ github.sha }}",
         "REPORT_JSON": "liveness-primer-report.json",
