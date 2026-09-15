@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import re
 import shlex
 from collections import defaultdict
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Concatenate, ParamSpec, TypeVar
 
 import tree_sitter_typescript as tsts
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Node, Parser
 
 from skylos.core.file_discovery import should_exclude_path
+from skylos.core.js_ast import (
+    ImportBinding,
+    is_type_only,
+    iter_import_clause_bindings,
+    member_chain,
+)
 
 from .nextjs import (
     NEXTJS_CONVENTION_EXPORTS,
@@ -98,9 +107,36 @@ _SCRIPT_RUNTIME_TOOLS = frozenset(
 )
 _SCRIPT_COMMAND_SEPARATORS = frozenset({"&", "&&", ";", "|", "||"})
 _SCRIPT_ENV_WRAPPERS = frozenset({"cross-env", "cross-env-shell", "env"})
+_ESBUILD_MODULES = frozenset({"esbuild"})
 _ESBUILD_BUILD_METHODS = frozenset({"build", "buildSync", "context"})
+_STATIC_HELPER_MODULES = {
+    "node:path": "path",
+    "path": "path",
+    "node:url": "url",
+    "url": "url",
+}
+_STATIC_HELPER_MODULE_NAMES = frozenset(_STATIC_HELPER_MODULES)
+_STATIC_HELPER_NAMES = {
+    "path": frozenset({"dirname", "join", "resolve"}),
+    "url": frozenset({"fileURLToPath"}),
+}
 _ESBUILD_PROMISE_METHODS = frozenset({"catch", "finally", "then"})
 _MAX_ESBUILD_ENTRY_GLOBS = MAX_TYPESCRIPT_GLOB_MATCHES
+_MAX_ESBUILD_STATIC_STEPS = MAX_TYPESCRIPT_GLOB_MATCHES * 8
+_MAX_ESBUILD_STATIC_DEPTH = 32
+_MUTATING_CONTAINER_METHODS = frozenset(
+    {
+        "copyWithin",
+        "fill",
+        "pop",
+        "push",
+        "reverse",
+        "shift",
+        "sort",
+        "splice",
+        "unshift",
+    }
+)
 _STRING_FRAGMENT_TYPES = frozenset({"string_fragment", "escape_sequence"})
 
 
@@ -110,6 +146,86 @@ class _TsEntryDiscovery:
     kind: str
     reason: str
     scope: str
+
+
+@dataclass
+class _EsbuildStaticContext:
+    source: bytes
+    config_path: str
+    default_base_dir: str
+    bindings: dict[str, Node]
+    direct_calls: dict[str, str]
+    namespaces: dict[str, str]
+    esbuild_direct: frozenset[str]
+    esbuild_namespaces: frozenset[str]
+    steps: int = 0
+    depth: int = 0
+
+    def visit(self) -> bool:
+        """Consume one bounded static-evaluation step."""
+        self.steps += 1
+        return self.steps <= _MAX_ESBUILD_STATIC_STEPS
+
+    def restart(self) -> None:
+        """Give the next top-level build call its own step budget."""
+        self.steps = 0
+
+
+_FoldItem = TypeVar("_FoldItem")
+_FoldValue = TypeVar("_FoldValue")
+_FoldParams = ParamSpec("_FoldParams")
+_StaticFold = Callable[
+    Concatenate[_EsbuildStaticContext, _FoldParams], _FoldValue | None
+]
+
+
+def _bounded_static_fold(
+    func: _StaticFold[_FoldParams, _FoldValue],
+) -> _StaticFold[_FoldParams, _FoldValue]:
+    """Keep recursive folding inside the interpreter stack."""
+
+    @functools.wraps(func)
+    def wrapper(
+        context: _EsbuildStaticContext,
+        *args: _FoldParams.args,
+        **kwargs: _FoldParams.kwargs,
+    ) -> _FoldValue | None:
+        if context.depth >= _MAX_ESBUILD_STATIC_DEPTH:
+            return None
+        context.depth += 1
+        try:
+            return func(context, *args, **kwargs)
+        finally:
+            context.depth -= 1
+
+    return wrapper
+
+
+def _fold_static_values(
+    items: Iterable[_FoldItem],
+    fold: Callable[[_FoldItem], _FoldValue | None],
+) -> list[_FoldValue] | None:
+    """Fold every item, abandoning the sequence as soon as one is not static."""
+    values: list[_FoldValue] = []
+    for item in items:
+        value = fold(item)
+        if value is None:
+            return None
+        values.append(value)
+    return values
+
+
+def _resolve_static_binding(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+    fold: Callable[[_EsbuildStaticContext, Node, frozenset[str]], _FoldValue | None],
+) -> _FoldValue | None:
+    """Fold a module-level `const` through its initializer, refusing cycles."""
+    name = _node_text(context.source, node)
+    if name in resolving or name not in context.bindings:
+        return None
+    return fold(context, context.bindings[name], resolving | {name})
 
 
 def resolve_ts_module(source: str, importer: str, monorepo_resolver=None) -> str | None:
@@ -596,7 +712,7 @@ def _entry_parser_for_path(path: str) -> Parser | None:
     return _ENTRY_PARSER_CACHE[lang_id]
 
 
-def _load_entry_config_ast(path: str) -> tuple[bytes, object] | tuple[None, None]:
+def _load_entry_config_ast(path: str) -> tuple[bytes, Node] | tuple[None, None]:
     parser = _entry_parser_for_path(path)
     if parser is None:
         return None, None
@@ -1011,43 +1127,159 @@ def _discover_tsup_config_entries(
     )
 
 
-def _esbuild_import_bindings(source: bytes, root_node) -> tuple[set[str], set[str]]:
-    """Return immutable named-call and namespace bindings imported from esbuild."""
-    direct: set[str] = set()
+@dataclass(frozen=True)
+class _ValueImportBindings:
+    """Local names a single value (non-type) import statement introduces."""
+
+    module: str | None
+    named: dict[str, str]
+    namespaces: frozenset[str]
+    default: str | None
+
+
+_NO_IMPORT_BINDINGS = _ValueImportBindings(None, {}, frozenset(), None)
+
+
+def _value_import_bindings(
+    source: bytes, statement: Node, modules: frozenset[str]
+) -> _ValueImportBindings:
+    """Read local bindings from a value import of one of `modules`."""
+    if statement.type != "import_statement" or is_type_only(statement):
+        return _NO_IMPORT_BINDINGS
+    module = _string_node_value(source, statement.child_by_field_name("source"))
+    if module not in modules:
+        return _NO_IMPORT_BINDINGS
+    named: dict[str, str] = {}
     namespaces: set[str] = set()
+    default: str | None = None
+    for binding in _value_clause_bindings(source, statement):
+        if binding.kind == "namespace":
+            namespaces.add(binding.local)
+        elif binding.kind == "default":
+            default = binding.local
+        else:
+            named[binding.local] = binding.imported
+    return _ValueImportBindings(module, named, frozenset(namespaces), default)
 
+
+def _value_clause_bindings(source: bytes, statement: Node) -> Iterator[ImportBinding]:
+    """Yield a statement's bindings, dropping the type-only specifiers."""
+    for clause in statement.named_children:
+        if clause.type != "import_clause":
+            continue
+        for binding in iter_import_clause_bindings(source, clause):
+            if not binding.type_only:
+                yield binding
+
+
+def _esbuild_const_bindings(source: bytes, statement: Node) -> dict[str, Node]:
+    if statement.type != "lexical_declaration" or not any(
+        child.type == "const" for child in statement.children
+    ):
+        return {}
+    bindings: dict[str, Node] = {}
+    for declarator in statement.named_children:
+        if declarator.type != "variable_declarator":
+            continue
+        name = declarator.child_by_field_name("name")
+        value = declarator.child_by_field_name("value")
+        if name is not None and name.type == "identifier" and value is not None:
+            bindings[_node_text(source, name)] = value
+    return bindings
+
+
+def _esbuild_static_import(
+    source: bytes, statement: Node
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Bind the `node:path` and `node:url` helpers this fold can prove."""
+    bindings = _value_import_bindings(source, statement, _STATIC_HELPER_MODULE_NAMES)
+    kind = _STATIC_HELPER_MODULES.get(bindings.module or "")
+    if kind is None:
+        return {}, {}
+    helpers = _STATIC_HELPER_NAMES[kind]
+    direct_calls = {
+        local: f"{kind}.{imported}"
+        for local, imported in bindings.named.items()
+        if imported in helpers
+    }
+    namespaces = dict.fromkeys(bindings.namespaces, kind)
+    if bindings.default is not None:
+        namespaces[bindings.default] = kind
+    return direct_calls, namespaces
+
+
+def _mutating_call_target(source: bytes, call_node: Node) -> Node | None:
+    function = call_node.child_by_field_name("function")
+    if function is None or function.type != "member_expression":
+        return None
+    method = function.child_by_field_name("property")
+    if method is None or _node_text(source, method) not in _MUTATING_CONTAINER_METHODS:
+        return None
+    return function
+
+
+def _esbuild_mutated_bindings(source: bytes, root_node: Node) -> set[str]:
+    """Names whose bound container is written to after it is initialized."""
+    mutated: set[str] = set()
+    for node in _iter_ts_nodes(root_node):
+        if node.type == "assignment_expression":
+            target = node.child_by_field_name("left")
+        elif node.type == "call_expression":
+            target = _mutating_call_target(source, node)
+        else:
+            continue
+        if target is None or target.type not in {
+            "member_expression",
+            "subscript_expression",
+        }:
+            continue
+        root = target.child_by_field_name("object")
+        if root is not None and root.type == "identifier":
+            mutated.add(_node_text(source, root))
+    return mutated
+
+
+def _esbuild_static_context(
+    source: bytes,
+    root_node: Node,
+    config_path: str,
+    default_base_dir: str,
+) -> _EsbuildStaticContext | None:
+    """Read every module-level binding in one pass; None if esbuild is unused."""
+    bindings: dict[str, Node] = {}
+    direct_calls: dict[str, str] = {}
+    namespaces: dict[str, str] = {}
+    esbuild_direct: set[str] = set()
+    esbuild_namespaces: set[str] = set()
     for statement in root_node.named_children:
-        if statement.type != "import_statement":
-            continue
-        source_node = statement.child_by_field_name("source")
-        if _string_node_value(source, source_node) != "esbuild":
-            continue
-        statement_text = _node_text(source, statement).lstrip()
-        if statement_text.startswith("import type "):
-            continue
-
-        for child in statement.named_children:
-            if child.type != "import_clause":
-                continue
-            for binding in _iter_ts_nodes(child):
-                if binding.type == "import_specifier":
-                    if _node_text(source, binding).lstrip().startswith("type "):
-                        continue
-                    imported = binding.child_by_field_name("name")
-                    alias = binding.child_by_field_name("alias")
-                    imported_name = _node_text(source, imported) if imported else ""
-                    if imported_name in _ESBUILD_BUILD_METHODS:
-                        direct.add(_node_text(source, alias or imported))
-                elif binding.type == "namespace_import":
-                    identifiers = [
-                        node
-                        for node in binding.named_children
-                        if node.type == "identifier"
-                    ]
-                    if identifiers:
-                        namespaces.add(_node_text(source, identifiers[-1]))
-
-    return direct, namespaces
+        esbuild = _value_import_bindings(source, statement, _ESBUILD_MODULES)
+        esbuild_direct.update(
+            local
+            for local, imported in esbuild.named.items()
+            if imported in _ESBUILD_BUILD_METHODS
+        )
+        esbuild_namespaces.update(esbuild.namespaces)
+        direct, imported_namespaces = _esbuild_static_import(source, statement)
+        direct_calls.update(direct)
+        namespaces.update(imported_namespaces)
+        declaration = statement
+        if statement.type == "export_statement":
+            declaration = statement.child_by_field_name("declaration") or statement
+        bindings.update(_esbuild_const_bindings(source, declaration))
+    if not esbuild_direct and not esbuild_namespaces:
+        return None
+    for name in _esbuild_mutated_bindings(source, root_node):
+        bindings.pop(name, None)
+    return _EsbuildStaticContext(
+        source=source,
+        config_path=os.path.realpath(config_path),
+        default_base_dir=os.path.realpath(default_base_dir),
+        bindings=bindings,
+        direct_calls=direct_calls,
+        namespaces=namespaces,
+        esbuild_direct=frozenset(esbuild_direct),
+        esbuild_namespaces=frozenset(esbuild_namespaces),
+    )
 
 
 def _unwrap_esbuild_static_expression(node):
@@ -1122,8 +1354,8 @@ def _is_top_level_esbuild_call(source: bytes, call_node) -> bool:
 def _is_esbuild_call(
     source: bytes,
     call_node,
-    direct_bindings: set[str],
-    namespace_bindings: set[str],
+    direct_bindings: frozenset[str],
+    namespace_bindings: frozenset[str],
 ) -> bool:
     if not _is_top_level_esbuild_call(source, call_node):
         return False
@@ -1145,88 +1377,347 @@ def _is_esbuild_call(
     )
 
 
-def _static_esbuild_string(source: bytes, node) -> str | None:
+def _static_esbuild_call_name(
+    context: _EsbuildStaticContext, call_node: Node
+) -> str | None:
+    function = call_node.child_by_field_name("function")
+    if function is None:
+        return None
+    if function.type == "identifier":
+        return context.direct_calls.get(_node_text(context.source, function))
+    chain = member_chain(context.source, function)
+    if len(chain) != 2:
+        return None
+    namespace = context.namespaces.get(chain[0])
+    if chain[1] in _STATIC_HELPER_NAMES.get(namespace or "", frozenset()):
+        return f"{namespace}.{chain[1]}"
+    return None
+
+
+def _is_import_meta_url(source: bytes, node: Node) -> bool:
+    unwrapped = _unwrap_esbuild_static_expression(node)
+    return (
+        unwrapped is not None
+        and unwrapped.type == "member_expression"
+        and _node_text(source, unwrapped) == "import.meta.url"
+    )
+
+
+def _static_esbuild_identifier_string(
+    context: _EsbuildStaticContext,
+    node: Node,
+    local_strings: dict[str, str] | None,
+    resolving: frozenset[str],
+) -> str | None:
+    name = _node_text(context.source, node)
+    if local_strings is not None and name in local_strings:
+        return local_strings[name]
+    return _resolve_static_binding(
+        context,
+        node,
+        resolving,
+        lambda bound, value, seen: _static_esbuild_string(bound, value, None, seen),
+    )
+
+
+def _static_esbuild_template_string(
+    context: _EsbuildStaticContext,
+    node: Node,
+    local_strings: dict[str, str] | None,
+    resolving: frozenset[str],
+) -> str | None:
+    parts: list[str] = []
+    for child in node.children:
+        if child.type in {"`", "comment"}:
+            continue
+        if child.type in _STRING_FRAGMENT_TYPES:
+            parts.append(_node_text(context.source, child))
+            continue
+        if child.type != "template_substitution" or len(child.named_children) != 1:
+            return None
+        value = _static_esbuild_string(
+            context,
+            child.named_children[0],
+            local_strings,
+            resolving,
+        )
+        if value is None:
+            return None
+        parts.append(value)
+    return "".join(parts)
+
+
+def _static_esbuild_path_call(
+    context: _EsbuildStaticContext, call_name: str, values: list[str]
+) -> str | None:
+    if call_name == "path.dirname" and len(values) == 1:
+        return os.path.dirname(values[0])
+    if call_name == "path.join" and values:
+        # `join` drops empty segments, concatenates, and only then normalizes:
+        # the first non-empty segment sets the root and a later absolute one
+        # merely extends it. `resolve` is the call that restarts from a root.
+        segments = [segment for segment in values if segment]
+        if not segments:
+            return "."
+        head, *rest = segments
+        joined = os.path.join(head, *(segment.lstrip("/") for segment in rest))
+        if os.sep == "/":
+            # posixpath.normpath keeps a doubled leading slash and Node's
+            # posix join never emits one. On Windows both keep it, because
+            # there it roots a UNC share rather than an ordinary path.
+            joined = re.sub("^//+", "/", joined)
+        return os.path.normpath(joined)
+    if call_name == "path.resolve" and values:
+        return os.path.abspath(os.path.join(context.default_base_dir, *values))
+    return None
+
+
+def _static_esbuild_call_string(
+    context: _EsbuildStaticContext,
+    node: Node,
+    local_strings: dict[str, str] | None,
+    resolving: frozenset[str],
+) -> str | None:
+    call_name = _static_esbuild_call_name(context, node)
+    arguments = node.child_by_field_name("arguments")
+    if call_name is None or arguments is None:
+        return None
+    argument_nodes = arguments.named_children
+    if call_name == "url.fileURLToPath":
+        if len(argument_nodes) == 1 and _is_import_meta_url(
+            context.source, argument_nodes[0]
+        ):
+            return context.config_path
+        return None
+    values = _fold_static_values(
+        argument_nodes,
+        lambda argument: _static_esbuild_string(
+            context, argument, local_strings, resolving
+        ),
+    )
+    if values is None:
+        return None
+    return _static_esbuild_path_call(context, call_name, values)
+
+
+@_bounded_static_fold
+def _static_esbuild_string(
+    context: _EsbuildStaticContext,
+    node: Node | None,
+    local_strings: dict[str, str] | None = None,
+    resolving: frozenset[str] = frozenset(),
+) -> str | None:
     node = _unwrap_esbuild_static_expression(node)
     if node is None:
         return None
     if node.type == "string":
-        return _string_node_value(source, node)
-    if node.type != "template_string" or any(
-        child.type == "template_substitution" for child in node.named_children
-    ):
+        return _string_node_value(context.source, node)
+    if not context.visit():
         return None
-    text = _node_text(source, node)
-    return text[1:-1] if len(text) >= 2 else None
+    if node.type == "identifier":
+        return _static_esbuild_identifier_string(
+            context, node, local_strings, resolving
+        )
+    if node.type == "template_string":
+        return _static_esbuild_template_string(context, node, local_strings, resolving)
+    if node.type == "call_expression":
+        return _static_esbuild_call_string(context, node, local_strings, resolving)
+    return None
 
 
-def _static_esbuild_object(source: bytes, node) -> dict[str, object] | None:
-    node = _unwrap_esbuild_static_expression(node)
-    if node is None or node.type != "object":
+def _static_esbuild_object_child(
+    context: _EsbuildStaticContext,
+    child: Node,
+    resolving: frozenset[str],
+) -> dict[str, Node] | None:
+    if child.type == "comment":
+        return {}
+    if child.type == "spread_element" and len(child.named_children) == 1:
+        return _static_esbuild_object(context, child.named_children[0], resolving)
+    if child.type != "pair":
         return None
+    key = _pair_key_text(context.source, child)
+    value = _pair_value_node(child)
+    if key is None or value is None:
+        return None
+    return {key: value}
 
-    properties: dict[str, object] = {}
-    for child in node.named_children:
-        if child.type == "comment":
-            continue
-        if child.type != "pair":
-            return None
-        key = _pair_key_text(source, child)
-        value = _pair_value_node(child)
-        if key is None or value is None:
-            return None
-        properties[key] = value
+
+def _static_esbuild_object_properties(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+) -> dict[str, Node] | None:
+    children = _fold_static_values(
+        node.named_children,
+        lambda child: _static_esbuild_object_child(context, child, resolving),
+    )
+    if children is None:
+        return None
+    properties: dict[str, Node] = {}
+    for child_properties in children:
+        properties.update(child_properties)
     return properties
 
 
-def _static_esbuild_entries(source: bytes, node) -> list[str] | None:
+@_bounded_static_fold
+def _static_esbuild_object(
+    context: _EsbuildStaticContext,
+    node: Node | None,
+    resolving: frozenset[str] = frozenset(),
+) -> dict[str, Node] | None:
     node = _unwrap_esbuild_static_expression(node)
-    if node is None:
+    if node is None or not context.visit():
         return None
+    if node.type == "identifier":
+        return _resolve_static_binding(context, node, resolving, _static_esbuild_object)
+    if node.type == "object":
+        return _static_esbuild_object_properties(context, node, resolving)
+    return None
 
-    if node.type == "array":
-        entries: list[str] = []
-        expecting_value = True
-        saw_value = False
-        for child in node.children:
-            if child.type in {"[", "]", "comment"}:
-                continue
-            if child.type == ",":
-                if expecting_value:
-                    return None
-                expecting_value = True
-                continue
-            if not expecting_value:
-                return None
-            saw_value = True
-            expecting_value = False
-            if child.type == "comment":
-                continue
-            value = _static_esbuild_string(source, child)
-            if value is not None:
-                entries.append(value)
-                continue
-            advanced = _static_esbuild_object(source, child)
-            if advanced is None or set(advanced) != {"in", "out"}:
-                return None
-            input_path = _static_esbuild_string(source, advanced.get("in"))
-            output_path = _static_esbuild_string(source, advanced.get("out"))
-            if input_path is None or output_path is None:
-                return None
-            entries.append(input_path)
-        if not saw_value:
-            return []
-        return entries
 
-    entry_map = _static_esbuild_object(source, node)
+def _static_esbuild_map_shape(
+    context: _EsbuildStaticContext, node: Node
+) -> tuple[Node, Node] | None:
+    function = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    if function is None or function.type != "member_expression" or arguments is None:
+        return None
+    property_node = function.child_by_field_name("property")
+    source_node = function.child_by_field_name("object")
+    if property_node is None or source_node is None:
+        return None
+    if _node_text(context.source, property_node) != "map":
+        return None
+    if len(arguments.named_children) != 1:
+        return None
+    return source_node, arguments.named_children[0]
+
+
+def _static_esbuild_map_callback(
+    context: _EsbuildStaticContext, callback: Node
+) -> tuple[str, Node] | None:
+    if callback.type != "arrow_function":
+        return None
+    parameters = callback.child_by_field_name(
+        "parameters"
+    ) or callback.child_by_field_name("parameter")
+    body = callback.child_by_field_name("body")
+    if parameters is None or body is None:
+        return None
+    identifiers = [
+        child for child in _iter_ts_nodes(parameters) if child.type == "identifier"
+    ]
+    if len(identifiers) != 1:
+        return None
+    return _node_text(context.source, identifiers[0]), body
+
+
+def _static_esbuild_map_entries(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+) -> list[str] | None:
+    shape = _static_esbuild_map_shape(context, node)
+    if shape is None:
+        return None
+    source_node, callback = shape
+    values = _static_esbuild_entries(context, source_node, resolving)
+    callback_parts = _static_esbuild_map_callback(context, callback)
+    if values is None or callback_parts is None:
+        return None
+    parameter, body = callback_parts
+    return _fold_static_values(
+        values,
+        lambda value: _static_esbuild_string(
+            context, body, {parameter: value}, resolving
+        ),
+    )
+
+
+def _esbuild_array_nodes(node: Node) -> list[Node] | None:
+    values: list[Node] = []
+    expecting_value = True
+    for child in node.children:
+        if child.type in {"[", "]", "comment"}:
+            continue
+        if child.type == ",":
+            if expecting_value:
+                return None
+            expecting_value = True
+            continue
+        if not expecting_value:
+            return None
+        values.append(child)
+        expecting_value = False
+    return values
+
+
+def _static_esbuild_array_entry(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+) -> str | None:
+    value = _static_esbuild_string(context, node, resolving=resolving)
+    if value is not None:
+        return value
+    advanced = _static_esbuild_object(context, node, resolving)
+    if advanced is None or set(advanced) != {"in", "out"}:
+        return None
+    input_path = _static_esbuild_string(
+        context, advanced.get("in"), resolving=resolving
+    )
+    output_path = _static_esbuild_string(
+        context, advanced.get("out"), resolving=resolving
+    )
+    return input_path if input_path is not None and output_path is not None else None
+
+
+def _static_esbuild_array_entries(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+) -> list[str] | None:
+    nodes = _esbuild_array_nodes(node)
+    if nodes is None:
+        return None
+    return _fold_static_values(
+        nodes, lambda child: _static_esbuild_array_entry(context, child, resolving)
+    )
+
+
+def _static_esbuild_object_entries(
+    context: _EsbuildStaticContext,
+    node: Node,
+    resolving: frozenset[str],
+) -> list[str] | None:
+    entry_map = _static_esbuild_object(context, node, resolving)
     if entry_map is None:
         return None
-    entries = []
-    for value_node in entry_map.values():
-        value = _static_esbuild_string(source, value_node)
-        if value is None:
-            return None
-        entries.append(value)
-    return entries
+    return _fold_static_values(
+        entry_map.values(),
+        lambda value: _static_esbuild_string(context, value, resolving=resolving),
+    )
+
+
+@_bounded_static_fold
+def _static_esbuild_entries(
+    context: _EsbuildStaticContext,
+    node: Node | None,
+    resolving: frozenset[str] = frozenset(),
+) -> list[str] | None:
+    node = _unwrap_esbuild_static_expression(node)
+    if node is None or not context.visit():
+        return None
+    if node.type == "identifier":
+        return _resolve_static_binding(
+            context, node, resolving, _static_esbuild_entries
+        )
+    if node.type == "call_expression":
+        return _static_esbuild_map_entries(context, node, resolving)
+    if node.type == "array":
+        return _static_esbuild_array_entries(context, node, resolving)
+    return _static_esbuild_object_entries(context, node, resolving)
 
 
 def _discover_esbuild_config_entries(
@@ -1244,9 +1735,13 @@ def _discover_esbuild_config_entries(
     if source is None or root_node is None or root_node.has_error:
         return set()
 
-    direct_bindings, namespace_bindings = _esbuild_import_bindings(source, root_node)
-    if not direct_bindings and not namespace_bindings:
+    static_context = _esbuild_static_context(
+        source, root_node, config_path, default_base_dir
+    )
+    if static_context is None:
         return set()
+    direct_bindings = static_context.esbuild_direct
+    namespace_bindings = static_context.esbuild_namespaces
 
     matches: set[str] = set()
     glob_requests: set[tuple[str, str]] = set()
@@ -1258,13 +1753,16 @@ def _discover_esbuild_config_entries(
         arguments = node.child_by_field_name("arguments")
         if arguments is None or not arguments.named_children:
             continue
-        options = _static_esbuild_object(source, arguments.named_children[0])
+        static_context.restart()
+        options = _static_esbuild_object(static_context, arguments.named_children[0])
         if options is None or "entryPoints" not in options:
             continue
 
         base_dir = default_base_dir
         if "absWorkingDir" in options:
-            working_dir = _static_esbuild_string(source, options["absWorkingDir"])
+            working_dir = _static_esbuild_string(
+                static_context, options["absWorkingDir"]
+            )
             if working_dir is None:
                 continue
             resolved_base = resolve_bounded_base(default_base_dir, working_dir)
@@ -1272,7 +1770,7 @@ def _discover_esbuild_config_entries(
                 continue
             base_dir = resolved_base
 
-        entry_values = _static_esbuild_entries(source, options["entryPoints"])
+        entry_values = _static_esbuild_entries(static_context, options["entryPoints"])
         if entry_values is None:
             continue
         for entry in dict.fromkeys(entry_values):
