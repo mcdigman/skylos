@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -17,6 +18,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from skylos.core.grep_search_state import grep_probe_limit, retain_grep_probe
@@ -147,6 +149,8 @@ class GrepRequest:
     include_globs: tuple[str, ...]
     fixed_string: bool
     max_results: int
+    exclude_folders: tuple[str, ...] = ()
+    ignored_paths: tuple[str, ...] = ()
     project_root_is_file: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -156,6 +160,9 @@ class GrepRequest:
         except OSError:
             is_file = False
         object.__setattr__(self, "project_root_is_file", is_file)
+
+
+_GrepBatchGroupKey = tuple[str, tuple[str, ...], bool, tuple[str, ...], tuple[str, ...]]
 
 
 class _GrepEvidence(str):
@@ -275,6 +282,22 @@ _GREP_EXECUTION_DEADLINE: ContextVar[float | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _GrepScope:
+    """The search boundary the analyzer selected for one verification pass."""
+
+    exclude_folders: tuple[str, ...] = ()
+    ignored_paths: tuple[str, ...] = ()
+    exclusion_key: str = ""
+    project_root: str = ""
+
+
+_EMPTY_GREP_SCOPE = _GrepScope()
+_GREP_SCOPE: ContextVar[_GrepScope] = ContextVar(
+    "grep_search_scope", default=_EMPTY_GREP_SCOPE
+)
+
+
 def detect_language(file_path: str) -> str:
     ext = Path(file_path).suffix.lower()
     if ext in _PYTHON_EXTS:
@@ -337,6 +360,129 @@ def grep_execution_deadline(deadline: float | None) -> Iterator[None]:
         _GREP_EXECUTION_DEADLINE.reset(token)
 
 
+def _exclusion_pattern(pattern: str, project_root: str) -> str | None:
+    """Normalize one exclusion into a root-relative ``a/b`` path pattern."""
+    path = Path(pattern)
+    if path.is_absolute():
+        try:
+            path = path.resolve(strict=False).relative_to(
+                Path(project_root).resolve(strict=False)
+            )
+        except (OSError, ValueError):
+            return None
+    text = path.as_posix().strip("/")
+    text = text.removeprefix("**/").removesuffix("/**")
+    parts = [part for part in text.split("/") if part and part != "."]
+    return "/".join(parts) or None
+
+
+def _pattern_matches_anywhere(parts: Sequence[str], pattern: str) -> bool:
+    """Match ``!**/<pattern>/**`` ripgrep semantics against path segments."""
+    pattern_parts = pattern.split("/")
+    width = len(pattern_parts)
+    for start in range(len(parts) - width + 1):
+        if all(
+            fnmatchcase(parts[start + offset], pattern_parts[offset])
+            for offset in range(width)
+        ):
+            return True
+    return False
+
+
+def _folder_patterns_cover(patterns: Sequence[str], relative_path: str) -> bool:
+    parts = [part for part in relative_path.split("/") if part and part != "."]
+    return any(_pattern_matches_anywhere(parts, pattern) for pattern in patterns)
+
+
+def _ignored_paths_cover(ignored_paths: Sequence[str], relative_path: str) -> bool:
+    for ignored in ignored_paths:
+        base = ignored.rstrip("/")
+        if relative_path == base or relative_path.startswith(f"{base}/"):
+            return True
+    return False
+
+
+@contextmanager
+def grep_search_scope(
+    project_root: str,
+    exclude_folders: Sequence[str] = (),
+    ignored_paths: Sequence[str] = (),
+) -> Iterator[None]:
+    """Apply one analyzer search boundary to every grep request it generates.
+
+    Entries already covered by ``_GREP_EXCLUDE_DIRS`` or by a broader excluded
+    folder are dropped, so the generated commands carry each boundary once and
+    the cache discriminator stays stable as build artifacts come and go.
+    """
+    folders = {
+        pattern
+        for folder in exclude_folders
+        if (pattern := _exclusion_pattern(str(folder), project_root))
+        and pattern not in _GREP_EXCLUDE_DIRS
+    }
+    normalized_folders = tuple(sorted(folders))
+
+    covering = (*_GREP_EXCLUDE_DIRS, *normalized_folders)
+    normalized_ignored = tuple(
+        sorted(
+            {
+                str(ignored)
+                for ignored in ignored_paths
+                if not _folder_patterns_cover(covering, str(ignored).rstrip("/"))
+            }
+        )
+    )
+
+    digest = hashlib.sha256()
+    for pattern in normalized_folders:
+        digest.update(pattern.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+
+    token = _GREP_SCOPE.set(
+        _GrepScope(
+            exclude_folders=normalized_folders,
+            ignored_paths=normalized_ignored,
+            exclusion_key=digest.hexdigest(),
+            project_root=Path(project_root).as_posix().rstrip("/"),
+        )
+    )
+    try:
+        yield
+    finally:
+        _GREP_SCOPE.reset(token)
+
+
+def grep_exclusion_key() -> str:
+    """Return a cache discriminator for the analyzer-selected exclusions.
+
+    Git-ignored paths are deliberately excluded: they only ever shrink the
+    search space, and they churn with every build artifact.
+    """
+    return _GREP_SCOPE.get().exclusion_key
+
+
+def grep_scope_hides_evidence(grep_line: str) -> bool:
+    """Report whether a cached evidence line sits outside the active boundary."""
+    scope = _GREP_SCOPE.get()
+    if not scope.exclude_folders and not scope.ignored_paths:
+        return False
+    path = _grep_line_path(grep_line).replace("\\", "/")
+    if not path:
+        return False
+    root = scope.project_root
+    if root and path.startswith(f"{root}/"):
+        relative = path[len(root) + 1 :]
+    elif path.startswith("/") or ntpath.isabs(path):
+        return False
+    else:
+        relative = path.lstrip("./")
+    if not relative:
+        return False
+    return _folder_patterns_cover(
+        scope.exclude_folders, relative
+    ) or _ignored_paths_cover(scope.ignored_paths, relative)
+
+
 def _make_grep_request(
     pattern: str,
     project_root: str,
@@ -346,6 +492,7 @@ def _make_grep_request(
     fixed_string: bool,
     max_results: int,
 ) -> GrepRequest:
+    scope = _GREP_SCOPE.get()
     return GrepRequest(
         pattern=pattern,
         project_root=project_root,
@@ -355,7 +502,22 @@ def _make_grep_request(
         ),
         fixed_string=fixed_string,
         max_results=max_results,
+        exclude_folders=scope.exclude_folders,
+        ignored_paths=scope.ignored_paths,
     )
+
+
+def _root_anchored_exclude_glob(project_root: str, relative_path: str) -> str:
+    """Build a ripgrep glob that excludes one path under ``project_root`` only.
+
+    Ripgrep matches ``-g`` globs against the candidate path as printed, and
+    Skylos always searches an absolute root, so an anchored glob has to carry
+    that root behind a leading ``**/``.
+    """
+    root = os.path.abspath(project_root).replace("\\", "/").strip("/")
+    relative = relative_path.replace("\\", "/").strip("/")
+    suffix = "/**" if relative_path.endswith("/") else ""
+    return f"!**/{root}/{relative}{suffix}"
 
 
 def _ripgrep_command(request: GrepRequest, rg: str) -> list[str]:
@@ -375,6 +537,11 @@ def _ripgrep_command(request: GrepRequest, rg: str) -> list[str]:
         cmd.extend(["-g", glob])
     for directory in _GREP_EXCLUDE_DIRS:
         cmd.extend(["-g", f"!**/{directory}/**"])
+    for directory in request.exclude_folders:
+        cmd.extend(["-g", f"!**/{directory}/**"])
+    for ignored_path in request.ignored_paths:
+        glob = _root_anchored_exclude_glob(request.project_root, ignored_path)
+        cmd.extend(["-g", glob])
     return cmd
 
 
@@ -482,24 +649,7 @@ def _split_grep_evidence(line: str) -> tuple[str, int | None, str]:
 
 
 def _is_ignored_grep_path(path: str) -> bool:
-    components = [
-        component for component in path.replace("\\", "/").split("/") if component
-    ]
-    ignored_names = {
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".skylos",
-        ".venv",
-        "venv",
-        "__pycache__",
-        "node_modules",
-    }
-    return any(
-        component in ignored_names or component.endswith(".egg-info")
-        for component in components
-    )
+    return _folder_patterns_cover(_GREP_EXCLUDE_DIRS, path.replace("\\", "/"))
 
 
 def _filter_null_grep_output(stdout: str) -> list[str]:
@@ -740,6 +890,13 @@ def _grep_fallback_command(
     excludes: list[str] = []
     for directory in _GREP_EXCLUDE_DIRS:
         excludes.extend(["--exclude-dir", directory])
+    for directory in request.exclude_folders:
+        pattern = f"*/{directory}" if "/" in directory else directory
+        excludes.extend(["--exclude-dir", pattern])
+    for ignored_path in request.ignored_paths:
+        option = "--exclude-dir" if ignored_path.endswith("/") else "--exclude"
+        absolute = os.path.join(target, *ignored_path.rstrip("/").split("/"))
+        excludes.extend([option, absolute])
     return [
         grep,
         *grep_flags,
@@ -1344,8 +1501,14 @@ def _run_streamed_grep_batch(
     return results
 
 
-def _batch_group_key(request: GrepRequest) -> tuple[str, tuple[str, ...], bool]:
-    return request.project_root, request.include_globs, request.fixed_string
+def _batch_group_key(request: GrepRequest) -> _GrepBatchGroupKey:
+    return (
+        request.project_root,
+        request.include_globs,
+        request.fixed_string,
+        request.exclude_folders,
+        request.ignored_paths,
+    )
 
 
 def _requires_direct_grep(request: GrepRequest) -> bool:
@@ -1724,8 +1887,8 @@ def _run_ripgrep_batch(
 
 def _group_grep_requests(
     requests: Sequence[GrepRequest],
-) -> dict[tuple[str, tuple[str, ...], bool], list[GrepRequest]]:
-    groups: dict[tuple[str, tuple[str, ...], bool], list[GrepRequest]] = {}
+) -> dict[_GrepBatchGroupKey, list[GrepRequest]]:
+    groups: dict[_GrepBatchGroupKey, list[GrepRequest]] = {}
     for request in requests:
         groups.setdefault(_batch_group_key(request), []).append(request)
     return groups
