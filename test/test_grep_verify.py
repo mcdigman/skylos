@@ -47,6 +47,12 @@ from skylos.core.grep_verify_common import (
     _run_grep_request,
     _trusted_which,
     execute_grep_batch,
+    _batch_group_key,
+    _make_grep_request,
+    _ripgrep_command,
+    grep_exclusion_key,
+    grep_scope_hides_evidence,
+    grep_search_scope,
     replay_grep_results,
 )
 
@@ -722,6 +728,8 @@ class TestBatchedGrepVerify:
             "include_globs": ("*.py",),
             "fixed_string": False,
             "max_results": 5,
+            "exclude_folders": ("generated",),
+            "ignored_paths": ("ignored/",),
         }
         foo_request = GrepRequest(pattern=r"\bfoo\b", **common)
         bar_request = GrepRequest(pattern=r"\bbar\b", **common)
@@ -757,7 +765,10 @@ class TestBatchedGrepVerify:
             "/repo/z.py:9:bar()",
         )
         assert results[foo_request][0] is results[bar_request][0]
-        assert "--json" in mock_run.call_args.args[0]
+        command = mock_run.call_args.args[0]
+        assert "--json" in command
+        assert "!**/generated/**" in command
+        assert "!**/repo/ignored/**" in command
         assert mock_run.call_args.kwargs["input_text"] == (
             r"\bfoo\b" "\n" r"\bbar\b" "\n"
         )
@@ -2881,6 +2892,86 @@ class TestQualifiedReferenceSubstring:
 
 
 class TestAnalyzerIntegration:
+    @pytest.mark.parametrize("backend", ["ripgrep", "system-grep"])
+    def test_grep_verify_honors_every_analyzer_exclusion_source(
+        self, tmp_path, monkeypatch, backend
+    ):
+        git = shutil.which("git")
+        grep = shutil.which("grep")
+        if git is None or grep is None:
+            pytest.skip("git and grep are required for this regression test")
+        rg = shutil.which("rg")
+        if backend == "ripgrep" and rg is None:
+            pytest.skip("ripgrep is required for this regression test")
+
+        subprocess.run([git, "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / ".gitignore").write_text("gitignored/\n", encoding="utf-8")
+        (tmp_path / "candidates.py").write_text(
+            """def config_case():
+    return "config"
+
+def gitignore_case():
+    return "gitignore"
+
+def cli_case():
+    return "cli"
+
+def default_case():
+    return "default"
+
+def unused_control():
+    return "control"
+""",
+            encoding="utf-8",
+        )
+        cases = {
+            "configured": "config_case",
+            "gitignored": "gitignore_case",
+            "cli_only": "cli_case",
+            "build": "default_case",
+        }
+        for directory, name in cases.items():
+            evidence = tmp_path / directory
+            evidence.mkdir()
+            (evidence / "reference.py").write_text(
+                f"from candidates import {name}\n\n{name}()\n", encoding="utf-8"
+            )
+
+        from skylos.analyzer import analyze
+
+        def selected_backend(executable, _project_roots=()):
+            if executable == "rg":
+                return rg if backend == "ripgrep" else None
+            return grep
+
+        monkeypatch.setattr("skylos.analyzer._fast_discover", None)
+        monkeypatch.setattr(
+            "skylos.core.grep_verify_common._trusted_which", selected_backend
+        )
+        exclusions = ("configured", "cli_only", "build")
+        results = {
+            grep_verify: json.loads(
+                analyze(
+                    str(tmp_path),
+                    conf=0,
+                    exclude_folders=exclusions,
+                    grep_verify=grep_verify,
+                    grep_cache=False,
+                )
+            )
+            for grep_verify in (False, True)
+        }
+        names = {
+            grep_verify: {
+                finding["simple_name"] for finding in result["unused_functions"]
+            }
+            for grep_verify, result in results.items()
+        }
+
+        assert names[False] == {*cases.values(), "unused_control"}
+        assert names[True] == names[False]
+        assert results[True]["analysis_summary"]["grep_verify"]["rescued_count"] == 0
+
     def test_exhausted_budget_withholds_candidates_and_marks_scan_incomplete(
         self, tmp_path, monkeypatch
     ):
@@ -3745,3 +3836,154 @@ class TestGrepVerifyParallel:
         )
         assert "lib.helper" in verdicts
         assert verdicts["lib.helper"].alive
+
+
+class TestGrepSearchScope:
+    def test_scope_drops_exclusions_already_covered_by_static_globs(self):
+        with grep_search_scope(
+            "/repo",
+            ("__pycache__", "node_modules", "build", "/repo/src/generated"),
+            ("__pycache__/", "build/out/", ".claude/", "notes.txt"),
+        ):
+            request = _make_grep_request(
+                "helper",
+                "/repo",
+                use_regex=False,
+                include_globs=["*.py"],
+                fixed_string=True,
+                max_results=5,
+            )
+
+        assert request.exclude_folders == ("build", "src/generated")
+        assert request.ignored_paths == (".claude/", "notes.txt")
+
+        command = _ripgrep_command(request, "rg")
+        globs = [command[index + 1] for index, arg in enumerate(command) if arg == "-g"]
+        assert len(globs) == len(set(globs))
+        assert "!**/build/**" in globs
+        assert "!**/src/generated/**" in globs
+        assert "!**/repo/.claude/**" in globs
+        assert "!**/repo/notes.txt" in globs
+
+    def test_grep_fallback_receives_analyzer_and_git_exclusions(self):
+        with grep_search_scope("/repo", ("configured", "build"), ("gitignored/",)):
+            request = _make_grep_request(
+                "helper",
+                "/repo",
+                use_regex=False,
+                include_globs=["*.py"],
+                fixed_string=True,
+                max_results=5,
+            )
+        process_result = Mock(returncode=1, stdout="", stderr="")
+
+        with (
+            patch(
+                "skylos.core.grep_verify_common.shutil.which",
+                side_effect=lambda executable: (
+                    None if executable == "rg" else "/usr/bin/grep"
+                ),
+            ),
+            patch(
+                "skylos.core.grep_verify_common._run_bounded_subprocess",
+                return_value=process_result,
+            ) as mock_run,
+        ):
+            assert _run_grep_request(request, require_complete=True) == []
+
+        command = mock_run.call_args.args[0]
+        for directory in ("configured", "build"):
+            assert command[command.index(directory) - 1] == "--exclude-dir"
+        ignored = os.path.join(os.path.abspath("/repo"), "gitignored")
+        assert command[command.index(ignored) - 1] == "--exclude-dir"
+
+    def test_requests_from_different_scopes_do_not_share_a_process(self):
+        def request_for(scope_folders):
+            with grep_search_scope("/repo", scope_folders, ()):
+                return _make_grep_request(
+                    "helper",
+                    "/repo",
+                    use_regex=False,
+                    include_globs=["*.py"],
+                    fixed_string=True,
+                    max_results=5,
+                )
+
+        assert _batch_group_key(request_for(("build",))) != _batch_group_key(
+            request_for(("dist",))
+        )
+
+    def test_cache_key_tracks_exclusions_but_not_git_ignored_churn(self):
+        with grep_search_scope("/repo", ("build",), (".claude/",)):
+            baseline = grep_exclusion_key()
+        with grep_search_scope("/repo", ("build",), (".claude/", "coverage.xml")):
+            assert grep_exclusion_key() == baseline
+        with grep_search_scope("/repo", ("build", "docs"), (".claude/",)):
+            assert grep_exclusion_key() != baseline
+
+    def test_cached_evidence_outside_the_scope_is_dropped_on_read(self, tmp_path):
+        target = tmp_path / "target.py"
+        target.write_text("def helper():\n    return 1\n", encoding="utf-8")
+        finding = {
+            "name": "helper",
+            "full_name": "target.helper",
+            "simple_name": "helper",
+            "type": "function",
+            "file": str(target),
+            "line": 1,
+        }
+        cache = GrepCache()
+        cache.bind_repository(str(tmp_path))
+        root = Path(tmp_path).as_posix()
+        with grep_search_scope(str(tmp_path), ("build",), ()):
+            _store_cached_group_results(
+                cache,
+                "usage",
+                finding,
+                {
+                    "direct": [
+                        f"{root}/app.py:2:helper()",
+                        f"{root}/build/stale.py:4:helper()",
+                    ]
+                },
+            )
+            loaded = grep_verify_module._load_cached_group_results(
+                cache, "usage", finding
+            )
+
+        assert loaded == {"direct": [f"{root}/app.py:2:helper()"]}
+
+    def test_evidence_outside_the_project_root_is_kept(self):
+        with grep_search_scope("/repo", ("build",), ("ignored/",)):
+            assert grep_scope_hides_evidence("/repo/build/x.py:1:helper()") is True
+            assert grep_scope_hides_evidence("/repo/ignored/x.py:1:helper()") is True
+            assert grep_scope_hides_evidence("/repo/app.py:1:helper()") is False
+            assert grep_scope_hides_evidence("/other/build/x.py:1:helper()") is False
+            assert grep_scope_hides_evidence("/repo/src/ignored/x.py:1:h()") is False
+
+    def test_parallel_workers_inherit_the_active_scope(self, tmp_path):
+        target = tmp_path / "target.py"
+        target.write_text("def helper():\n    return 1\n", encoding="utf-8")
+        ignored = tmp_path / "generated"
+        ignored.mkdir()
+        (ignored / "reference.py").write_text(
+            "from target import helper\n\nhelper()\n", encoding="utf-8"
+        )
+        finding = {
+            "name": "helper",
+            "full_name": "target.helper",
+            "simple_name": "helper",
+            "type": "function",
+            "file": str(target),
+            "line": 1,
+            "confidence": 80,
+        }
+
+        unscoped = grep_verify_findings([finding], str(tmp_path), parallel=True)
+        scoped = grep_verify_findings(
+            [finding], str(tmp_path), parallel=True, exclude_folders=("generated",)
+        )
+
+        assert set(unscoped) == {"target.helper"}
+        assert scoped == {}
+        assert scoped.complete is True

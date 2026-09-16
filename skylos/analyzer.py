@@ -2180,6 +2180,9 @@ class Skylos:
                 project_root,
                 cache=grep_cache,
                 time_budget=grep_budget,
+                exclude_folders=getattr(self, "_analysis_scope", {}).get(
+                    "excluded_folders", ()
+                ),
                 **filter_kwargs,
             )
         finally:

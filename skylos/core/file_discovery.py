@@ -178,26 +178,12 @@ def find_git_root(path: str | Path) -> Path | None:
         current = parent
 
 
-def list_git_visible_files(path: str | Path) -> list[Path] | None:
-    root = find_git_root(path)
-    if root is None:
-        return None
-
-    target = Path(path).resolve()
-    if target.is_file():
-        target = target.parent
-
+def _git_ls_files(
+    root: Path, target: Path, selectors: Sequence[str]
+) -> list[str] | None:
+    """Run one read-only ``git ls-files`` below ``target`` and return its paths."""
     cmd = read_only_git_command(
-        [
-            "-C",
-            str(root),
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "--full-name",
-        ],
+        ["-C", str(root), "ls-files", "-z", *selectors, "--full-name"],
         literal_pathspecs=True,
     )
 
@@ -222,15 +208,62 @@ def list_git_visible_files(path: str | Path) -> list[Path] | None:
     if result.returncode != 0:
         return None
 
-    files = []
-    for raw_path in result.stdout.split(b"\0"):
-        if not raw_path:
-            continue
-        rel_path = os.fsdecode(raw_path)
-        files.append(root / rel_path)
+    return [os.fsdecode(raw) for raw in result.stdout.split(b"\0") if raw]
 
+
+def _git_query_target(path: str | Path) -> tuple[Path, Path] | None:
+    root = find_git_root(path)
+    if root is None:
+        return None
+    target = Path(path).resolve()
+    if target.is_file():
+        target = target.parent
+    return root, target
+
+
+def list_git_visible_files(path: str | Path) -> list[Path] | None:
+    query = _git_query_target(path)
+    if query is None:
+        return None
+    root, target = query
+
+    paths = _git_ls_files(root, target, ("--cached", "--others", "--exclude-standard"))
+    if paths is None:
+        return None
+
+    files = [root / rel_path for rel_path in paths]
     files.sort()
     return files
+
+
+def list_git_ignored_paths(path: str | Path) -> tuple[str, ...]:
+    """Return Git-ignored paths below ``path``, relative to it.
+
+    Directories keep a trailing slash so callers can tell them from files.
+    """
+    query = _git_query_target(path)
+    if query is None:
+        return ()
+    root, target = query
+
+    paths = _git_ls_files(
+        root, target, ("--others", "--ignored", "--exclude-standard", "--directory")
+    )
+    if paths is None:
+        return ()
+
+    ignored: list[str] = []
+    for repository_path in paths:
+        is_directory = repository_path.endswith("/")
+        try:
+            relative = (root / repository_path.rstrip("/")).relative_to(target)
+        except ValueError:
+            continue
+        normalized = relative.as_posix()
+        if not normalized or normalized == ".":
+            continue
+        ignored.append(f"{normalized}/" if is_directory else normalized)
+    return tuple(sorted(dict.fromkeys(ignored)))
 
 
 def _resolve_contained_source_file(file_path: Path, root_path: Path) -> Path | None:

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import json as _json
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from skylos.core.file_discovery import list_git_ignored_paths
 from skylos.core.grep_search_state import (
     GrepSearchResults,
     UNCLASSIFIED_STRATEGY,
@@ -23,6 +25,9 @@ from skylos.core.grep_verify_common import (
     execute_grep_batch,
     filter_grep_results,
     grep_execution_deadline,
+    grep_exclusion_key,
+    grep_scope_hides_evidence,
+    grep_search_scope,
     is_definition_line,
     is_substring_match,
     module_candidates,
@@ -136,7 +141,7 @@ class _PendingBatchFinding:
     requests: tuple[GrepRequest, ...]
 
 
-_GREP_VERIFY_CACHE_VERSION = "v11"
+_GREP_VERIFY_CACHE_VERSION = "v12"
 _GREP_FINDING_BATCH_SIZE = 32
 _GREP_CACHE_MAX_STRATEGIES = 64
 _GREP_CACHE_MAX_LINES_PER_STRATEGY = 256
@@ -184,7 +189,7 @@ def _cache_key(cache: Any, group_name: str, finding: dict) -> str | None:
         f"{_GREP_VERIFY_CACHE_VERSION}:group:{group_name}:"
         f"{simple_name}:{finding.get('full_name', '')}:"
         f"{finding.get('type', '')}:{content_hash}:"
-        f"repo:{repository_fingerprint}"
+        f"repo:{repository_fingerprint}:exclusions:{grep_exclusion_key()}"
     )
 
 
@@ -215,6 +220,10 @@ def _load_cached_group_results(
     evidence = _normalize_cached_group_results(decoded.get("evidence"))
     if evidence is None:
         return None
+    evidence = {
+        strategy: [line for line in lines if not grep_scope_hides_evidence(line)]
+        for strategy, lines in evidence.items()
+    }
     return GrepSearchResults(evidence, truncated_strategies=frozenset(truncated))
 
 
@@ -619,7 +628,15 @@ def _submit_next_finding(
     for finding in findings:
         if not _finding_verdict_key(finding):
             continue
-        pending.add(executor.submit(_process_finding, finding, search_fn, deadline))
+        pending.add(
+            executor.submit(
+                contextvars.copy_context().run,
+                _process_finding,
+                finding,
+                search_fn,
+                deadline,
+            )
+        )
         return True
     return False
 
@@ -733,41 +750,54 @@ def grep_verify_findings(
     max_workers: int = _DEFAULT_GREP_WORKERS,
     cache: Any = None,
     evidence_filter: GrepEvidenceFilter | None = None,
+    exclude_folders: Sequence[str] = (),
 ) -> GrepVerificationResult:
     cache_binder = getattr(type(cache), "bind_repository", None)
     if callable(cache_binder):
         cache_binder(cache, project_root)
     start_time = time.monotonic()
-    if not parallel:
-        try:
-            return _grep_verify_findings_batched(
-                findings, project_root, time_budget, cache, start_time, evidence_filter
-            )
-        except _GrepExecutionIncomplete:
-            return GrepVerificationResult(
-                {},
-                candidate_count=sum(bool(_finding_verdict_key(f)) for f in findings),
-                verified_count=0,
-                time_budget=time_budget,
-                incomplete_reason="verification_incomplete",
-            )
+    with grep_search_scope(
+        project_root, exclude_folders, list_git_ignored_paths(project_root)
+    ):
+        if not parallel:
+            try:
+                return _grep_verify_findings_batched(
+                    findings,
+                    project_root,
+                    time_budget,
+                    cache,
+                    start_time,
+                    evidence_filter,
+                )
+            except _GrepExecutionIncomplete:
+                return GrepVerificationResult(
+                    {},
+                    candidate_count=sum(
+                        bool(_finding_verdict_key(f)) for f in findings
+                    ),
+                    verified_count=0,
+                    time_budget=time_budget,
+                    incomplete_reason="verification_incomplete",
+                )
 
-    search_fn = _build_grep_search_fn(
-        project_root,
-        parallel=False,
-        max_workers=max_workers,
-        cache=cache,
-        search_all_strategies=evidence_filter is not None,
-    )
-    if evidence_filter is not None:
-        raw_search_fn = search_fn
+        search_fn = _build_grep_search_fn(
+            project_root,
+            parallel=False,
+            max_workers=max_workers,
+            cache=cache,
+            search_all_strategies=evidence_filter is not None,
+        )
+        if evidence_filter is not None:
+            raw_search_fn = search_fn
 
-        def search_fn(finding):
-            return _filter_evidence(finding, raw_search_fn(finding), evidence_filter)
+            def search_fn(finding):
+                return _filter_evidence(
+                    finding, raw_search_fn(finding), evidence_filter
+                )
 
-    return _grep_verify_findings_parallel(
-        findings, search_fn, time_budget, max_workers, start_time
-    )
+        return _grep_verify_findings_parallel(
+            findings, search_fn, time_budget, max_workers, start_time
+        )
 
 
 def _build_grep_search_fn(
