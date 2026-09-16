@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -19,6 +20,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skylos.core.file_discovery import find_git_root
+from skylos.core.git_safety import read_only_git_command, read_only_git_environment
 from skylos.core.grep_search_state import grep_probe_limit, retain_grep_probe
 
 logger = logging.getLogger(__name__)
@@ -147,10 +150,19 @@ class GrepRequest:
     include_globs: tuple[str, ...]
     fixed_string: bool
     max_results: int
+    exclude_folders: tuple[str, ...] = field(default=(), compare=False, hash=False)
+    ignored_paths: tuple[str, ...] = field(default=(), compare=False, hash=False)
+    scope_key: str = ""
     project_root_is_file: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Remember single-file roots before a later filesystem race."""
+        if not self.scope_key and (self.exclude_folders or self.ignored_paths):
+            object.__setattr__(
+                self,
+                "scope_key",
+                _grep_scope_digest(self.exclude_folders, self.ignored_paths),
+            )
         try:
             is_file = Path(self.project_root).is_file()
         except OSError:
@@ -261,6 +273,14 @@ class _GrepBatchResults(dict[GrepRequest, tuple[str, ...]]):
         self.incomplete_requests.update(getattr(other, "incomplete_requests", ()))
 
 
+_GrepBatchGroupKey = tuple[
+    str,
+    tuple[str, ...],
+    bool,
+    str,
+]
+
+
 _GREP_REQUEST_RECORDER: ContextVar[list[GrepRequest] | None] = ContextVar(
     "grep_request_recorder", default=None
 )
@@ -273,6 +293,13 @@ _GREP_REPLAY_DEADLINE: ContextVar[float | None] = ContextVar(
 _GREP_EXECUTION_DEADLINE: ContextVar[float | None] = ContextVar(
     "grep_execution_deadline", default=None
 )
+_GREP_EXCLUDE_FOLDERS: ContextVar[tuple[str, ...]] = ContextVar(
+    "grep_exclude_folders", default=()
+)
+_GREP_IGNORED_PATHS: ContextVar[tuple[str, ...]] = ContextVar(
+    "grep_ignored_paths", default=()
+)
+_GREP_SCOPE_KEY: ContextVar[str] = ContextVar("grep_scope_key", default="")
 
 
 def detect_language(file_path: str) -> str:
@@ -337,6 +364,111 @@ def grep_execution_deadline(deadline: float | None) -> Iterator[None]:
         _GREP_EXECUTION_DEADLINE.reset(token)
 
 
+def git_ignored_paths(project_root: str) -> tuple[str, ...]:
+    """Return Git-ignored files and collapsed directories below the scan root."""
+    git_root = find_git_root(project_root)
+    if git_root is None:
+        return ()
+    try:
+        target = Path(project_root).resolve(strict=True)
+        if target.is_file():
+            target = target.parent
+        relative_target = target.relative_to(git_root)
+    except (OSError, ValueError):
+        return ()
+
+    command = read_only_git_command(
+        [
+            "-C",
+            str(git_root),
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--full-name",
+        ],
+        literal_pathspecs=True,
+    )
+    if relative_target.parts:
+        command.extend(["--", relative_target.as_posix()])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            env=read_only_git_environment(),
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    ignored: list[str] = []
+    for raw_path in result.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        repository_path = os.fsdecode(raw_path)
+        is_directory = repository_path.endswith("/")
+        try:
+            relative_path = (git_root / repository_path.rstrip("/")).relative_to(target)
+        except ValueError:
+            continue
+        normalized = relative_path.as_posix()
+        if normalized and normalized != ".":
+            ignored.append(f"{normalized}/" if is_directory else normalized)
+    return tuple(sorted(dict.fromkeys(ignored)))
+
+
+def _grep_scope_digest(
+    exclude_folders: Sequence[str], ignored_paths: Sequence[str]
+) -> str:
+    """Return a fixed-size identity for one grep search boundary."""
+    digest = hashlib.sha256()
+    for label, values in (
+        (b"folders", exclude_folders),
+        (b"ignored", ignored_paths),
+    ):
+        digest.update(label)
+        digest.update(b"\0")
+        for value in values:
+            digest.update(value.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@contextmanager
+def grep_search_scope(
+    exclude_folders: Sequence[str] = (),
+    ignored_paths: Sequence[str] = (),
+) -> Iterator[None]:
+    """Apply one analyzer search boundary to all generated grep requests."""
+    normalized_folders = tuple(sorted({str(path) for path in exclude_folders}))
+    normalized_ignored = tuple(sorted({str(path) for path in ignored_paths}))
+    scope_key = _grep_scope_digest(normalized_folders, normalized_ignored)
+    folders_token = _GREP_EXCLUDE_FOLDERS.set(normalized_folders)
+    ignored_token = _GREP_IGNORED_PATHS.set(normalized_ignored)
+    scope_key_token = _GREP_SCOPE_KEY.set(scope_key)
+    try:
+        yield
+    finally:
+        _GREP_SCOPE_KEY.reset(scope_key_token)
+        _GREP_IGNORED_PATHS.reset(ignored_token)
+        _GREP_EXCLUDE_FOLDERS.reset(folders_token)
+
+
+def grep_search_scope_values() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the active grep search boundary."""
+    return _GREP_EXCLUDE_FOLDERS.get(), _GREP_IGNORED_PATHS.get()
+
+
+def grep_search_scope_key() -> str:
+    """Return a stable cache discriminator for the active search boundary."""
+    return _GREP_SCOPE_KEY.get()
+
+
 def _make_grep_request(
     pattern: str,
     project_root: str,
@@ -355,7 +487,26 @@ def _make_grep_request(
         ),
         fixed_string=fixed_string,
         max_results=max_results,
+        exclude_folders=_GREP_EXCLUDE_FOLDERS.get(),
+        ignored_paths=_GREP_IGNORED_PATHS.get(),
+        scope_key=_GREP_SCOPE_KEY.get(),
     )
+
+
+def _ripgrep_exclude_glob(exclude_folder: str, project_root: str) -> str | None:
+    path = Path(exclude_folder)
+    if path.is_absolute():
+        try:
+            path = path.resolve(strict=False).relative_to(
+                Path(project_root).resolve(strict=False)
+            )
+        except (OSError, ValueError):
+            return None
+    normalized = path.as_posix().strip("/")
+    normalized = normalized.removeprefix("**/").removesuffix("/**")
+    if not normalized:
+        return None
+    return f"!**/{normalized}/**"
 
 
 def _ripgrep_command(request: GrepRequest, rg: str) -> list[str]:
@@ -375,6 +526,15 @@ def _ripgrep_command(request: GrepRequest, rg: str) -> list[str]:
         cmd.extend(["-g", glob])
     for directory in _GREP_EXCLUDE_DIRS:
         cmd.extend(["-g", f"!**/{directory}/**"])
+    for directory in request.exclude_folders:
+        exclude_glob = _ripgrep_exclude_glob(directory, request.project_root)
+        if exclude_glob is not None:
+            cmd.extend(["-g", exclude_glob])
+    for ignored_path in request.ignored_paths:
+        normalized = ignored_path.rstrip("/")
+        if normalized:
+            suffix = "/**" if ignored_path.endswith("/") else ""
+            cmd.extend(["-g", f"!{normalized}{suffix}"])
     return cmd
 
 
@@ -740,6 +900,20 @@ def _grep_fallback_command(
     excludes: list[str] = []
     for directory in _GREP_EXCLUDE_DIRS:
         excludes.extend(["--exclude-dir", directory])
+    for directory in request.exclude_folders:
+        path = Path(directory)
+        normalized = path.as_posix().rstrip("/")
+        if not path.is_absolute() and "/" in normalized:
+            normalized = f"*/{normalized}"
+        if normalized:
+            excludes.extend(["--exclude-dir", normalized])
+    root = Path(request.project_root)
+    for ignored_path in request.ignored_paths:
+        normalized = ignored_path.rstrip("/")
+        if not normalized:
+            continue
+        option = "--exclude-dir" if ignored_path.endswith("/") else "--exclude"
+        excludes.extend([option, str(root / normalized)])
     return [
         grep,
         *grep_flags,
@@ -1344,8 +1518,13 @@ def _run_streamed_grep_batch(
     return results
 
 
-def _batch_group_key(request: GrepRequest) -> tuple[str, tuple[str, ...], bool]:
-    return request.project_root, request.include_globs, request.fixed_string
+def _batch_group_key(request: GrepRequest) -> _GrepBatchGroupKey:
+    return (
+        request.project_root,
+        request.include_globs,
+        request.fixed_string,
+        request.scope_key,
+    )
 
 
 def _requires_direct_grep(request: GrepRequest) -> bool:
@@ -1724,8 +1903,8 @@ def _run_ripgrep_batch(
 
 def _group_grep_requests(
     requests: Sequence[GrepRequest],
-) -> dict[tuple[str, tuple[str, ...], bool], list[GrepRequest]]:
-    groups: dict[tuple[str, tuple[str, ...], bool], list[GrepRequest]] = {}
+) -> dict[_GrepBatchGroupKey, list[GrepRequest]]:
+    groups: dict[_GrepBatchGroupKey, list[GrepRequest]] = {}
     for request in requests:
         groups.setdefault(_batch_group_key(request), []).append(request)
     return groups

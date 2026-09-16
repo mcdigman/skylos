@@ -4,13 +4,13 @@ import concurrent.futures
 import json as _json
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from skylos.core.grep_search_state import (
-    GrepSearchResults,
     UNCLASSIFIED_STRATEGY,
+    GrepSearchResults,
     track_grep_evidence_limits,
 )
 from skylos.core.grep_verify_common import (
@@ -22,7 +22,11 @@ from skylos.core.grep_verify_common import (
     detect_language,
     execute_grep_batch,
     filter_grep_results,
+    git_ignored_paths,
     grep_execution_deadline,
+    grep_search_scope,
+    grep_search_scope_key,
+    grep_search_scope_values,
     is_definition_line,
     is_substring_match,
     module_candidates,
@@ -136,7 +140,7 @@ class _PendingBatchFinding:
     requests: tuple[GrepRequest, ...]
 
 
-_GREP_VERIFY_CACHE_VERSION = "v11"
+_GREP_VERIFY_CACHE_VERSION = "v12"
 _GREP_FINDING_BATCH_SIZE = 32
 _GREP_CACHE_MAX_STRATEGIES = 64
 _GREP_CACHE_MAX_LINES_PER_STRATEGY = 256
@@ -184,7 +188,7 @@ def _cache_key(cache: Any, group_name: str, finding: dict) -> str | None:
         f"{_GREP_VERIFY_CACHE_VERSION}:group:{group_name}:"
         f"{simple_name}:{finding.get('full_name', '')}:"
         f"{finding.get('type', '')}:{content_hash}:"
-        f"repo:{repository_fingerprint}"
+        f"repo:{repository_fingerprint}:scope:{grep_search_scope_key()}"
     )
 
 
@@ -724,7 +728,7 @@ def _grep_verify_findings_parallel(
     )
 
 
-def grep_verify_findings(
+def _grep_verify_findings_scoped(
     findings: list[dict],
     project_root: str,
     time_budget: float = 30.0,
@@ -762,12 +766,38 @@ def grep_verify_findings(
     if evidence_filter is not None:
         raw_search_fn = search_fn
 
-        def search_fn(finding):
+        def filtered_search_fn(finding):
             return _filter_evidence(finding, raw_search_fn(finding), evidence_filter)
+
+        search_fn = filtered_search_fn
 
     return _grep_verify_findings_parallel(
         findings, search_fn, time_budget, max_workers, start_time
     )
+
+
+def grep_verify_findings(
+    findings: list[dict],
+    project_root: str,
+    time_budget: float = 30.0,
+    *,
+    parallel: bool = False,
+    max_workers: int = _DEFAULT_GREP_WORKERS,
+    cache: Any = None,
+    evidence_filter: GrepEvidenceFilter | None = None,
+    exclude_folders: Sequence[str] = (),
+) -> GrepVerificationResult:
+    ignored_paths = git_ignored_paths(project_root)
+    with grep_search_scope(exclude_folders, ignored_paths):
+        return _grep_verify_findings_scoped(
+            findings,
+            project_root,
+            time_budget,
+            parallel=parallel,
+            max_workers=max_workers,
+            cache=cache,
+            evidence_filter=evidence_filter,
+        )
 
 
 def _build_grep_search_fn(
@@ -778,23 +808,31 @@ def _build_grep_search_fn(
     cache: Any,
     search_all_strategies: bool = False,
 ) -> Callable[[dict], dict[str, list[str]]]:
+    exclude_folders, ignored_paths = grep_search_scope_values()
     if parallel and not search_all_strategies:
 
         def search_fn(finding: dict) -> dict[str, list[str]]:
-            return parallel_multi_strategy_search(
-                finding, project_root, max_workers=max_workers, cache=cache
-            )
+            with grep_search_scope(exclude_folders, ignored_paths):
+                return parallel_multi_strategy_search(
+                    finding, project_root, max_workers=max_workers, cache=cache
+                )
 
         return search_fn
 
     def search_fn(finding: dict) -> dict[str, list[str]]:
-        if cache is None:
-            return _search_verification_evidence(
-                finding, project_root, search_all_strategies=search_all_strategies
+        with grep_search_scope(exclude_folders, ignored_paths):
+            if cache is None:
+                return _search_verification_evidence(
+                    finding,
+                    project_root,
+                    search_all_strategies=search_all_strategies,
+                )
+            return _cached_serial_search_results(
+                finding,
+                project_root,
+                cache,
+                search_all_strategies=search_all_strategies,
             )
-        return _cached_serial_search_results(
-            finding, project_root, cache, search_all_strategies=search_all_strategies
-        )
 
     return search_fn
 

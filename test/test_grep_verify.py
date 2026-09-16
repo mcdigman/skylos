@@ -722,6 +722,8 @@ class TestBatchedGrepVerify:
             "include_globs": ("*.py",),
             "fixed_string": False,
             "max_results": 5,
+            "exclude_folders": ("generated",),
+            "ignored_paths": ("ignored/",),
         }
         foo_request = GrepRequest(pattern=r"\bfoo\b", **common)
         bar_request = GrepRequest(pattern=r"\bbar\b", **common)
@@ -757,7 +759,11 @@ class TestBatchedGrepVerify:
             "/repo/z.py:9:bar()",
         )
         assert results[foo_request][0] is results[bar_request][0]
-        assert "--json" in mock_run.call_args.args[0]
+        command = mock_run.call_args.args[0]
+        assert "--json" in command
+        assert "--no-ignore" in command
+        assert "!**/generated/**" in command
+        assert "!ignored/**" in command
         assert mock_run.call_args.kwargs["input_text"] == (
             r"\bfoo\b" "\n" r"\bbar\b" "\n"
         )
@@ -2347,6 +2353,40 @@ class TestBatchedGrepVerify:
             os.path.abspath("-repo"),
         ]
 
+    def test_grep_fallback_receives_analyzer_and_git_exclusions(self):
+        request = GrepRequest(
+            pattern="helper",
+            project_root="/repo",
+            use_regex=False,
+            include_globs=("*.py",),
+            fixed_string=True,
+            max_results=5,
+            exclude_folders=("configured", "cli_only", "build"),
+            ignored_paths=("ignored/",),
+        )
+        process_result = Mock(returncode=1, stdout="", stderr="")
+
+        with (
+            patch(
+                "skylos.core.grep_verify_common.shutil.which",
+                side_effect=lambda executable: (
+                    None if executable == "rg" else "/usr/bin/grep"
+                ),
+            ),
+            patch(
+                "skylos.core.grep_verify_common._run_bounded_subprocess",
+                return_value=process_result,
+            ) as mock_run,
+        ):
+            assert _run_grep_request(request, require_complete=True) == []
+
+        command = mock_run.call_args.args[0]
+        for directory in ("configured", "cli_only", "build"):
+            index = command.index(directory)
+            assert command[index - 1] == "--exclude-dir"
+        ignored = str(Path("/repo/ignored"))
+        assert command[command.index(ignored) - 1] == "--exclude-dir"
+
     def test_direct_ripgrep_preserves_colon_path(self):
         request = GrepRequest(
             pattern=r"helper\s*\(",
@@ -2990,6 +3030,115 @@ class TestAnalyzerIntegration:
 
         evidence.write_text("from target import _cached_helper\n\n_cached_helper()\n")
         assert "target._cached_helper" not in unused_functions()
+
+    def test_grep_cache_is_scoped_to_analyzer_exclusions(self, tmp_path):
+        target = tmp_path / "target.py"
+        target.write_text("def helper():\n    return 1\n", encoding="utf-8")
+        ignored = tmp_path / "ignored"
+        ignored.mkdir()
+        (ignored / "reference.py").write_text("helper()\n", encoding="utf-8")
+        finding = {
+            "name": "helper",
+            "full_name": "target.helper",
+            "simple_name": "helper",
+            "type": "function",
+            "file": str(target),
+            "line": 1,
+            "confidence": 80,
+        }
+        cache = GrepCache()
+
+        unscoped = grep_verify_findings([finding], str(tmp_path), cache=cache)
+        scoped = grep_verify_findings(
+            [finding],
+            str(tmp_path),
+            cache=cache,
+            exclude_folders=("ignored",),
+        )
+
+        assert set(unscoped) == {"target.helper"}
+        assert scoped == {}
+        assert scoped.complete is True
+
+    def test_grep_verify_ignores_every_analyzer_exclusion_source(
+        self, tmp_path, monkeypatch
+    ):
+        git = shutil.which("git")
+        grep = shutil.which("grep")
+        assert git is not None
+        assert grep is not None
+
+        subprocess.run([git, "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / ".gitignore").write_text("gitignored/\n", encoding="utf-8")
+        (tmp_path / "candidates.py").write_text(
+            """def config_case():
+    return "config"
+
+def gitignore_case():
+    return "gitignore"
+
+def cli_case():
+    return "cli"
+
+def default_case():
+    return "default"
+
+def unused_control():
+    return "control"
+""",
+            encoding="utf-8",
+        )
+        cases = {
+            "configured": "config_case",
+            "gitignored": "gitignore_case",
+            "cli_only": "cli_case",
+            "build": "default_case",
+        }
+        for directory, name in cases.items():
+            evidence = tmp_path / directory
+            evidence.mkdir()
+            (evidence / "reference.py").write_text(
+                f"from candidates import {name}\n\n{name}()\n", encoding="utf-8"
+            )
+
+        from skylos.analyzer import analyze
+
+        def trusted_backend(executable, _project_roots=()):
+            return None if executable == "rg" else grep
+
+        monkeypatch.setattr("skylos.analyzer._fast_discover", None)
+        monkeypatch.setattr(
+            "skylos.core.grep_verify_common._trusted_which", trusted_backend
+        )
+        exclusions = ("configured", "cli_only", "build")
+        result_off = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                exclude_folders=exclusions,
+                grep_verify=False,
+                grep_cache=False,
+            )
+        )
+        result_on = json.loads(
+            analyze(
+                str(tmp_path),
+                conf=0,
+                exclude_folders=exclusions,
+                grep_verify=True,
+                grep_cache=False,
+            )
+        )
+
+        names_off = {
+            finding["simple_name"] for finding in result_off["unused_functions"]
+        }
+        names_on = {
+            finding["simple_name"] for finding in result_on["unused_functions"]
+        }
+        assert names_off == {*cases.values(), "unused_control"}
+        assert names_on == names_off
+        assert result_on["analysis_summary"]["grep_verify"]["rescued_count"] == 0
 
     def test_grep_verify_matches_static_analysis_for_unrelated_parameters(
         self, tmp_path
