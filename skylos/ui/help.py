@@ -32,8 +32,31 @@ COMMANDS = [
         "group": "AI Agent",
     },
     {
+        "name": "skylos review [path]",
+        "desc": "Review a finding and remember the local decision",
+        "details": [
+            "Interactive: scan, select a finding, then mark it false positive or accept risk temporarily",
+            "list [path]: show local decisions and their expiry",
+            "restore <decision-id> [path]: revoke a decision and show the finding again",
+            "Local decisions are operator-owned and ignored in CI",
+        ],
+        "group": "Core Analysis",
+    },
+    {
         "name": "skylos discover <path>",
         "desc": "Inventory LLM/AI integrations and agent tools",
+        "group": "Core Analysis",
+    },
+    {
+        "name": "skylos sbom [path] [--output sbom.cdx.json]",
+        "desc": "Export supported dependency inventory as offline CycloneDX 1.6 JSON",
+        "details": [
+            "--output, -o  Write a file; default '-' writes JSON to stdout",
+            "--format cyclonedx-json  CycloneDX JSON output (default)",
+            "No installs, project scripts, or network requests",
+            "Exit 2 on unreadable, unsupported, or incomplete inputs; keeps partial output",
+            "Includes all recorded environments, not an installed or licence inventory",
+        ],
         "group": "Core Analysis",
     },
     {

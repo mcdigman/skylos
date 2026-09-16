@@ -10,9 +10,11 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from skylos.visitors.test_aware import TestAwareVisitor
 from skylos.visitors.framework_aware import FrameworkAwareVisitor
+from skylos.visitors.base import Definition
 from skylos.analysis.penalties import _check_abstract_overrides, apply_penalties
 from skylos.deadcode.config_entrypoints import configured_entrypoint_reason
 from skylos.engines.go_runner import GoEngineError
+from skylos.core.safe_cache_io import write_text_no_symlink
 
 from skylos.analyzer import (
     Skylos,
@@ -218,7 +220,9 @@ class TestSkylos:
         result = skylos._module(root, file_path)
         assert result == "main"
 
-    def test_module_name_generation_strips_rightmost_source_root(self, skylos, tmp_path):
+    def test_module_name_generation_strips_rightmost_source_root(
+        self, skylos, tmp_path
+    ):
         # Path contains BOTH "python" and "src" source-root names. The old
         # implementation iterated a set and stripped whichever name came first,
         # producing module names that depended on PYTHONHASHSEED. The result
@@ -239,7 +243,8 @@ class TestSkylos:
         # #773) must strip the LAST occurrence deterministically.
         root = tmp_path
         file_path = (
-            root / "mcp-servers/src/data_analysis_server/src/data_analysis_server/visualization/plots.py"
+            root
+            / "mcp-servers/src/data_analysis_server/src/data_analysis_server/visualization/plots.py"
         )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text("x = 1\n", encoding="utf-8")
@@ -4099,6 +4104,97 @@ function foo() {
         assert ("dead.ts", "helper") in unused_by_file
         assert ("dead.ts", "foo") in unused_by_file
 
+    def test_transitive_dead_resolves_each_filename_once_per_pass(
+        self, monkeypatch, tmp_path
+    ):
+        source = tmp_path / "chain.py"
+        dead = Definition("pkg.dead", "function", source, 1)
+        middle = Definition("pkg.middle", "function", source, 2)
+        leaf = Definition("pkg.leaf", "function", source, 3)
+        middle.called_by = {dead.name}
+        leaf.called_by = {middle.name}
+        analyzer = Skylos()
+        analyzer.defs = {"leaf": leaf, "middle": middle, "dead": dead}
+        original_resolve = Path.resolve
+        resolved = []
+
+        def record_resolve(path, *args, **kwargs):
+            resolved.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", record_resolve)
+
+        for _ in range(2):
+            dead.references = 0
+            middle.references = 1
+            leaf.references = 1
+            analyzer._propagate_transitive_dead()
+            assert (dead.references, middle.references, leaf.references) == (0, 0, 0)
+
+        assert resolved.count(source) == 2
+
+    def test_transitive_dead_refreshes_symlink_identity_between_passes(
+        self, tmp_path
+    ):
+        dead_dir = tmp_path / "dead"
+        live_dir = tmp_path / "live"
+        dead_dir.mkdir()
+        live_dir.mkdir()
+        dead_path = dead_dir / "module.py"
+        live_path = live_dir / "module.py"
+        alias = tmp_path / "selected.py"
+        try:
+            alias.symlink_to(dead_path)
+        except OSError as error:
+            pytest.skip(f"symlinks unavailable: {error}")
+
+        dead_caller = Definition("pkg.caller", "function", dead_path, 1)
+        live_caller = Definition("pkg.caller", "function", live_path, 1)
+        live_caller.references = 1
+        live_caller.is_exported = True
+        leaf = Definition("pkg.leaf", "function", alias, 2)
+        leaf.references = 1
+        leaf.called_by = {"pkg.caller"}
+        analyzer = Skylos()
+        analyzer.defs = {
+            "dead-caller": dead_caller,
+            "live-caller": live_caller,
+            "leaf": leaf,
+        }
+
+        analyzer._propagate_transitive_dead()
+        assert leaf.references == 0
+
+        alias.unlink()
+        alias.symlink_to(live_path)
+        leaf.references = 1
+        analyzer._propagate_transitive_dead()
+
+        assert leaf.references == 1
+
+    def test_transitive_dead_does_not_swallow_path_errors(self, monkeypatch, tmp_path):
+        analyzer = Skylos()
+        analyzer.defs = {
+            "work": Definition("pkg.work", "function", tmp_path / "app.py", 1)
+        }
+        original_resolve = Path.resolve
+        attempts = 0
+
+        def fail_once(path, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporarily unavailable")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", fail_once)
+
+        with pytest.raises(OSError, match="temporarily unavailable"):
+            analyzer._propagate_transitive_dead()
+        analyzer._propagate_transitive_dead()
+
+        assert attempts == 2
+
     def test_analyze_single_file_skips_project_unused_dependency_rule(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text(
             '[project]\nname = "demo"\ndependencies = ["requests", "rich"]\n',
@@ -4149,10 +4245,7 @@ def fake_call():
         monkeypatch.setenv("SKYLOS_JOBS", "1")
         src = tmp_path / "app.py"
         src.write_text(
-            "def read(length: int = ...) -> int:\n"
-            "    return length + 5\n"
-            "\n"
-            "read()\n",
+            "def read(length: int = ...) -> int:\n    return length + 5\n\nread()\n",
             encoding="utf-8",
         )
 
@@ -4194,12 +4287,8 @@ class SupportsRead(Protocol):
             analyze(str(tmp_path), conf=0, enable_quality=True, grep_verify=False)
         )
         assert result.get("analysis_errors", []) == []
-        l032 = [
-            f for f in result.get("quality", []) if f.get("rule_id") == "SKY-L032"
-        ]
-        l026 = [
-            f for f in result.get("quality", []) if f.get("rule_id") == "SKY-L026"
-        ]
+        l032 = [f for f in result.get("quality", []) if f.get("rule_id") == "SKY-L032"]
+        l026 = [f for f in result.get("quality", []) if f.get("rule_id") == "SKY-L026"]
         assert l032 == []
         assert l026 == []
 
@@ -4502,7 +4591,8 @@ def _issue_706_cache_file(root):
     github_token = "ghp_" + "1234567890abcdef" * 2 + "1234"
     cache_file = root / ".skylos" / "cache" / "grep_results.json"
     cache_file.parent.mkdir(parents=True)
-    cache_file.write_text(  # skylos: ignore[SKY-D324] all callers pass pytest-owned temp roots
+    assert write_text_no_symlink(
+        cache_file,
         json.dumps(
             {
                 "version": 1,
@@ -4515,7 +4605,6 @@ def _issue_706_cache_file(root):
                 },
             }
         ),
-        encoding="utf-8",
     )
     return cache_file
 
@@ -4530,9 +4619,7 @@ def _issue_706_cache_findings(result):
 
 def _issue_706_init_ignored_cache_repo(root):
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    (root / ".gitignore").write_text(  # skylos: ignore[SKY-D324] all callers pass pytest-owned temp roots
-        ".skylos/\n", encoding="utf-8"
-    )
+    assert write_text_no_symlink(root / ".gitignore", ".skylos/\n")
 
 
 def test_recursive_secret_scan_skips_untracked_generated_grep_cache(tmp_path):
@@ -4540,9 +4627,7 @@ def test_recursive_secret_scan_skips_untracked_generated_grep_cache(tmp_path):
     _issue_706_init_ignored_cache_repo(tmp_path)
     _issue_706_cache_file(tmp_path)
 
-    result = json.loads(
-        analyze(str(tmp_path), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(tmp_path), enable_secrets=True, grep_verify=False))
 
     assert _issue_706_cache_findings(result) == []
 
@@ -4551,9 +4636,7 @@ def test_non_git_project_skips_its_generated_grep_cache(tmp_path):
     (tmp_path / "app.py").write_text("print('clean')\n", encoding="utf-8")
     _issue_706_cache_file(tmp_path)
 
-    result = json.loads(
-        analyze(str(tmp_path), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(tmp_path), enable_secrets=True, grep_verify=False))
 
     assert _issue_706_cache_findings(result) == []
 
@@ -4583,8 +4666,7 @@ def test_grep_evidence_with_secret_is_not_persisted_in_project(tmp_path):
 
     assert list(cache_file.parent.glob(cache_file.name)) == []
     assert any(
-        finding.get("file") == "evidence.yaml"
-        and finding.get("provider") == "github"
+        finding.get("file") == "evidence.yaml" and finding.get("provider") == "github"
         for finding in first.get("secrets", [])
     )
     assert not any(
@@ -4621,9 +4703,7 @@ def test_recursive_secret_scan_keeps_tracked_grep_cache_visible(tmp_path):
         check=True,
     )
 
-    result = json.loads(
-        analyze(str(tmp_path), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(tmp_path), enable_secrets=True, grep_verify=False))
 
     cache_findings = _issue_706_cache_findings(result)
     assert cache_findings
@@ -4644,9 +4724,7 @@ def test_nested_git_repo_uses_its_own_tracked_cache_state(tmp_path):
         check=True,
     )
 
-    result = json.loads(
-        analyze(str(nested), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(nested), enable_secrets=True, grep_verify=False))
 
     assert _issue_706_cache_findings(result)
 
@@ -4658,9 +4736,7 @@ def test_generated_grep_cache_git_probe_failure_scans_fail_closed(
     _issue_706_cache_file(tmp_path)
     monkeypatch.setattr("skylos.analyzer._git_tracking_status", lambda _path: None)
 
-    result = json.loads(
-        analyze(str(tmp_path), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(tmp_path), enable_secrets=True, grep_verify=False))
 
     assert _issue_706_cache_findings(result)
 
@@ -4681,8 +4757,7 @@ def test_explicit_generated_grep_cache_scan_is_not_suppressed(tmp_path, target_k
     )
 
     assert any(
-        finding.get("provider") == "github"
-        for finding in result.get("secrets", [])
+        finding.get("provider") == "github" for finding in result.get("secrets", [])
     )
 
 
@@ -4719,13 +4794,10 @@ def test_grep_cache_lookalike_paths_remain_scannable(tmp_path, relative_path):
         json.dumps({"token": github_token}), encoding="utf-8"
     )
 
-    result = json.loads(
-        analyze(str(tmp_path), enable_secrets=True, grep_verify=False)
-    )
+    result = json.loads(analyze(str(tmp_path), enable_secrets=True, grep_verify=False))
 
     assert any(
-        finding.get("file") == relative_path
-        and finding.get("provider") == "github"
+        finding.get("file") == relative_path and finding.get("provider") == "github"
         for finding in result.get("secrets", [])
     )
 
@@ -4748,13 +4820,15 @@ def test_generated_grep_cache_tracking_status_is_fail_closed(
         actual = _git_tracking_status(candidate)
 
     assert actual is expected
-    assert git_run.call_args.args[0] == [
-        "git",
+    command = git_run.call_args.args[0]
+    assert command[-4:] == [
         "ls-files",
         "--error-unmatch",
         "--",
         ".skylos/cache/grep_results.json",
     ]
+    assert "core.fsmonitor=false" in command
+    assert git_run.call_args.kwargs["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
 
 
 def test_generated_grep_cache_tracking_timeout_is_unknown(tmp_path):
@@ -4767,6 +4841,30 @@ def test_generated_grep_cache_tracking_timeout_is_unknown(tmp_path):
         side_effect=subprocess.TimeoutExpired("git", 5),
     ):
         assert _git_tracking_status(candidate) is None
+
+
+def test_generated_grep_cache_tracking_probe_disables_fsmonitor(tmp_path):
+    from skylos.analyzer import _git_tracking_status
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    candidate = tmp_path / ".skylos" / "cache" / "grep_results.json"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("{}", encoding="utf-8")
+    sentinel = tmp_path / "fsmonitor-ran"
+    helper = tmp_path / "fsmonitor-hook"
+    helper.write_text(
+        f"#!/bin/sh\ntouch '{sentinel}'\nexit 1\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    subprocess.run(
+        ["git", "config", "core.fsmonitor", str(helper)],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    assert _git_tracking_status(candidate) is False
+    assert not sentinel.exists()
 
 
 _ISSUE_693_UV_LOCK = """\

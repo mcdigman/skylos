@@ -182,6 +182,13 @@ def _compact_finding_metadata(metadata: Any) -> dict[str, Any] | None:
         "affected_range",
         "fixed_version",
         "cvss_score",
+        "fingerprint_version",
+        "stable_fingerprint",
+        "context_hash",
+        "rule_revision",
+        "language",
+        "symbol",
+        "review_decision",
     }
     compact = {key: metadata[key] for key in keep_keys if key in metadata}
     aliases = metadata.get("aliases")
@@ -213,6 +220,13 @@ def _compact_upload_finding(
         "category": str(finding.get("category") or "QUALITY").upper(),
     }
     tool_rule_id = finding.get("tool_rule_id")
+    if finding.get("kind") == "repo_policy" and finding.get("rule_id") in {
+        "SKY-R101",
+        "SKY-R102",
+        "SKY-R103",
+        "SKY-R104",
+    }:
+        compact["kind"] = "repo_policy"
     if tool_rule_id:
         compact["tool_rule_id"] = str(tool_rule_id)[:100]
     if include_snippet and compact["category"] != "SECRET":

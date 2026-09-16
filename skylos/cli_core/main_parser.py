@@ -131,7 +131,7 @@ Run 'skylos tour' for a guided walkthrough of capabilities.
     )
     parser.add_argument(
         "--format",
-        choices=("rich", "pretty", "json", "llm", "github", "concise"),
+        choices=("rich", "pretty", "json", "llm", "github", "gitlab", "concise"),
         default="rich",
         help=(
             "Output format. Use 'pretty' for grouped human output or "
@@ -242,6 +242,13 @@ Run 'skylos tour' for a guided walkthrough of capabilities.
         "--baseline",
         action="store_true",
         help="Only report findings not in the baseline. Run 'skylos baseline .' first.",
+    )
+    parser.add_argument(
+        "--baseline-ref",
+        metavar="REF",
+        default=None,
+        help="Read dependency baseline from a trusted Git revision (implies --baseline). "
+        "Required for dependency baseline filtering in CI; use the target branch commit SHA.",
     )
     parser.add_argument(
         "--diff-base",

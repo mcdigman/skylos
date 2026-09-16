@@ -37,6 +37,7 @@ _DEAD_CODE_RULE_IDS: dict[str, str] = {
     "unused_variables": "SKY-U003",
     "unused_classes": "SKY-U004",
     "unused_parameters": "SKY-U006",
+    "unused_files": "SKY-E002",
 }
 
 
@@ -149,6 +150,15 @@ def _build_quality_signal(
 
 
 def _dead_code_severity(item: dict[str, Any]) -> str:
+    explicit = str(item.get("severity") or "").upper()
+    if item.get("rule_id") in {"SKY-E002", "SKY-E003"} and explicit in {
+        "CRITICAL",
+        "HIGH",
+        "MEDIUM",
+        "LOW",
+        "INFO",
+    }:
+        return explicit
     confidence = int(item.get("confidence") or 0)
     if confidence >= 90:
         return "MEDIUM"
@@ -164,9 +174,17 @@ def _build_dead_code_signal(
     rule_id: str,
     file_path: str,
 ) -> DebtSignal:
+    rule_id = str(item.get("rule_id") or rule_id)
     line = int(item.get("line") or item.get("lineno") or 1)
-    subject = str(item.get("name") or item.get("simple_name") or category)
-    message = f"Unused {category.replace('unused_', '').replace('_', ' ')}: {subject}"
+    subject = str(
+        item.get("name")
+        or item.get("simple_name")
+        or (Path(file_path).name if category == "unused_files" else category)
+    )
+    message = str(
+        item.get("message")
+        or f"Unused {category.replace('unused_', '').replace('_', ' ')}: {subject}"
+    )
     return DebtSignal(
         fingerprint=_signal_fingerprint("dead_code", rule_id, file_path, line, subject),
         dimension="dead_code",
@@ -298,15 +316,32 @@ def run_debt_analysis(
     target = Path(path).resolve()
     project_root = _project_root(target)
 
+    from skylos.core.review_decisions import (
+        apply_trusted_review_decisions,
+        review_scan_requirements,
+    )
+
+    include_review_context, include_review_proofs = review_scan_requirements(
+        project_root
+    )
+    analysis_options = {
+        "conf": conf,
+        "enable_quality": True,
+        "enable_danger": False,
+        "enable_secrets": False,
+        "exclude_folders": list(exclude_folders or []),
+    }
+    if include_review_context:
+        analysis_options["include_review_context"] = True
+    if include_review_proofs:
+        analysis_options["include_review_proofs"] = True
+
     raw = run_analyze(
         str(target),
-        conf=conf,
-        enable_quality=True,
-        enable_danger=False,
-        enable_secrets=False,
-        exclude_folders=list(exclude_folders or []),
+        **analysis_options,
     )
     result = json.loads(raw) if isinstance(raw, str) else raw
+    result = apply_trusted_review_decisions(result, project_root)
 
     return build_debt_snapshot(
         result,

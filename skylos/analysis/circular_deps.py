@@ -17,6 +17,28 @@ def _module_root(module_name: str) -> str:
     return module_name.split(".")[0] if module_name else ""
 
 
+def _is_module_or_descendant(module_name: str, ancestor: str) -> bool:
+    return module_name == ancestor or module_name.startswith(f"{ancestor}.")
+
+
+def _is_ancestor_fallback(from_module: str, import_module: str, target: str) -> bool:
+    return import_module.startswith(f"{target}.") and _is_module_or_descendant(
+        from_module, target
+    )
+
+
+def _without_ancestor_fallbacks(
+    from_module: str,
+    import_module: str,
+    targets: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    return {
+        target: target_names
+        for target, target_names in targets.items()
+        if not _is_ancestor_fallback(from_module, import_module, target)
+    }
+
+
 def _known_module_names(module_name: str) -> Set[str]:
     if not module_name:
         return set()
@@ -74,13 +96,16 @@ def _circular_import_targets(
     Collapsing ``pkg -> pkg.child`` to ``pkg -> pkg`` invents a self-cycle,
     while discarding that edge would hide a real child-to-package cycle.
     Keep the exact resolved graph within a package; unresolved symbols still
-    fall back to their known containing module.
+    fall back to their known containing module. A missing descendant that falls
+    back to the importer or one of its ancestors does not add a real dependency.
+    Keep fallbacks into sibling packages because importing them can execute the
+    sibling package initializer.
     """
     if not targets:
         return {}
     root = _module_root(import_module)
     if _module_root(from_module) == root:
-        return targets
+        return _without_ancestor_fallbacks(from_module, import_module, targets)
     return {root: names}
 
 
@@ -156,12 +181,15 @@ class DependencyGraphBuilder(ast.NodeVisitor):
 
     def _record_import(self, module, line, import_type, names):
         targets = _import_targets(module, import_type, names, self.known_modules)
+        architecture_targets = _without_ancestor_fallbacks(
+            self.module_name, module, targets
+        )
         circular_targets = _circular_import_targets(
             self.module_name, module, names, targets
         )
         for graph, graph_targets in (
             (self.dependencies, circular_targets),
-            (self.architecture_dependencies, targets),
+            (self.architecture_dependencies, architecture_targets),
         ):
             for target, target_names in graph_targets.items():
                 graph.append(
@@ -196,11 +224,14 @@ class CircularDependencyAnalyzer:
 
         for module_name, raw_imports in raw_imports_by_module.items():
             for import_module, line, import_type, names in raw_imports:
-                architecture_targets = _import_targets(
+                targets = _import_targets(
                     import_module, import_type, names, self.known_modules
                 )
+                architecture_targets = _without_ancestor_fallbacks(
+                    module_name, import_module, targets
+                )
                 circular_targets = _circular_import_targets(
-                    module_name, import_module, names, architecture_targets
+                    module_name, import_module, names, targets
                 )
                 for target, target_names in circular_targets.items():
                     dep = ModuleDependency(
@@ -239,17 +270,23 @@ class CircularDependencyAnalyzer:
 
     def _find_cycles_fast(self) -> List[List[str]]:
         """Rust-accelerated cycle detection."""
-        edges = []
-        for frm, tos in self.dependencies.items():
-            for to in tos:
-                edges.append((frm, to))
-        modules = list(self.modules.keys())
+        # Sorted so the traversal is a pure function of the graph rather than
+        # of set iteration order (PYTHONHASHSEED) or file discovery order.
+        edges = sorted(
+            (frm, to) for frm, tos in self.dependencies.items() for to in tos
+        )
+        modules = sorted(self.modules)
         return _fast_find_cycles(edges, modules)
 
     def _find_cycles_py(self) -> List[List[str]]:
         """Pure Python DFS cycle detection."""
         cycles = []
         visited = set()
+        # Sorted once up front: the traversal is then a pure function of the
+        # graph rather than of set iteration order (PYTHONHASHSEED).
+        adjacency = {
+            node: sorted(neighbors) for node, neighbors in self.dependencies.items()
+        }
 
         def dfs(node, path, path_set):
             if node in path_set:
@@ -266,7 +303,7 @@ class CircularDependencyAnalyzer:
             path.append(node)
             path_set.add(node)
 
-            for neighbor in self.dependencies.get(node, []):
+            for neighbor in adjacency.get(node, ()):
                 found_cycles.extend(dfs(neighbor, path, path_set))
 
             path.pop()
@@ -275,7 +312,8 @@ class CircularDependencyAnalyzer:
 
             return found_cycles
 
-        for node in self.modules:
+        # Roots sorted too, so file discovery order cannot change the result.
+        for node in sorted(self.modules):
             visited.clear()
             found = dfs(node, [], set())
             for cycle in found:
@@ -335,7 +373,7 @@ class CircularDependencyAnalyzer:
                 )
             )
 
-        findings.sort(key=lambda f: len(f.cycle))
+        findings.sort(key=lambda f: (len(f.cycle), f.cycle))
 
         return findings
 

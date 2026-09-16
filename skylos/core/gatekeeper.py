@@ -39,6 +39,7 @@ DEAD_CODE_RESULT_KEYS = (
     "unused_variables",
     "unused_classes",
     "unused_parameters",
+    "unused_files",
 )
 AGENT_GATE_PREFIX = "Agent gate: "
 BASELINE_GATE_CONFIG = {
@@ -590,6 +591,16 @@ def _analysis_incomplete_reasons(results):
         languages = []
     if languages:
         reasons.append("Incomplete language engine coverage: " + ", ".join(languages))
+
+    sca_coverage = summary.get("sca_coverage")
+    if isinstance(sca_coverage, dict):
+        status = sca_coverage.get("status")
+        # Coverage limitations (including unresolved manifest ranges) are not
+        # operational failures; only an interrupted or unavailable scan is.
+        if status in ("incomplete", "unavailable", "unknown"):
+            reasons.append(
+                f"Dependency vulnerability scan incomplete (status: {status})"
+            )
 
     return reasons
 
