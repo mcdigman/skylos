@@ -150,12 +150,19 @@ class GrepRequest:
     include_globs: tuple[str, ...]
     fixed_string: bool
     max_results: int
-    exclude_folders: tuple[str, ...] = ()
-    ignored_paths: tuple[str, ...] = ()
+    exclude_folders: tuple[str, ...] = field(default=(), compare=False, hash=False)
+    ignored_paths: tuple[str, ...] = field(default=(), compare=False, hash=False)
+    scope_key: str = ""
     project_root_is_file: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Remember single-file roots before a later filesystem race."""
+        if not self.scope_key and (self.exclude_folders or self.ignored_paths):
+            object.__setattr__(
+                self,
+                "scope_key",
+                _grep_scope_digest(self.exclude_folders, self.ignored_paths),
+            )
         try:
             is_file = Path(self.project_root).is_file()
         except OSError:
@@ -270,8 +277,7 @@ _GrepBatchGroupKey = tuple[
     str,
     tuple[str, ...],
     bool,
-    tuple[str, ...],
-    tuple[str, ...],
+    str,
 ]
 
 
@@ -416,6 +422,23 @@ def git_ignored_paths(project_root: str) -> tuple[str, ...]:
     return tuple(sorted(dict.fromkeys(ignored)))
 
 
+def _grep_scope_digest(
+    exclude_folders: Sequence[str], ignored_paths: Sequence[str]
+) -> str:
+    """Return a fixed-size identity for one grep search boundary."""
+    digest = hashlib.sha256()
+    for label, values in (
+        (b"folders", exclude_folders),
+        (b"ignored", ignored_paths),
+    ):
+        digest.update(label)
+        digest.update(b"\0")
+        for value in values:
+            digest.update(value.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
 @contextmanager
 def grep_search_scope(
     exclude_folders: Sequence[str] = (),
@@ -424,19 +447,10 @@ def grep_search_scope(
     """Apply one analyzer search boundary to all generated grep requests."""
     normalized_folders = tuple(sorted({str(path) for path in exclude_folders}))
     normalized_ignored = tuple(sorted({str(path) for path in ignored_paths}))
-    digest = hashlib.sha256()
-    for label, values in (
-        (b"folders", normalized_folders),
-        (b"ignored", normalized_ignored),
-    ):
-        digest.update(label)
-        digest.update(b"\0")
-        for value in values:
-            digest.update(value.encode("utf-8", errors="surrogateescape"))
-            digest.update(b"\0")
+    scope_key = _grep_scope_digest(normalized_folders, normalized_ignored)
     folders_token = _GREP_EXCLUDE_FOLDERS.set(normalized_folders)
     ignored_token = _GREP_IGNORED_PATHS.set(normalized_ignored)
-    scope_key_token = _GREP_SCOPE_KEY.set(digest.hexdigest()[:16])
+    scope_key_token = _GREP_SCOPE_KEY.set(scope_key)
     try:
         yield
     finally:
@@ -475,6 +489,7 @@ def _make_grep_request(
         max_results=max_results,
         exclude_folders=_GREP_EXCLUDE_FOLDERS.get(),
         ignored_paths=_GREP_IGNORED_PATHS.get(),
+        scope_key=_GREP_SCOPE_KEY.get(),
     )
 
 
@@ -1508,8 +1523,7 @@ def _batch_group_key(request: GrepRequest) -> _GrepBatchGroupKey:
         request.project_root,
         request.include_globs,
         request.fixed_string,
-        request.exclude_folders,
-        request.ignored_paths,
+        request.scope_key,
     )
 
 
