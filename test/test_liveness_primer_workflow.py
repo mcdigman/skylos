@@ -63,8 +63,6 @@ def test_liveness_primer_workflow_pins_actions_and_toolchain():
     action_steps = [step for step in steps if "uses" in step]
 
     assert {step["uses"] for step in action_steps} == {
-        "actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae",
-        "actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
@@ -126,62 +124,13 @@ def test_liveness_primer_workflow_builds_trusted_base_go_engine():
     assert '[[ "$trusted_checkout_sha" != "$TRUSTED_BASE_SHA" ]]' in script
     assert "cd _trusted_skylos/skylos/engines/go" in script
     assert 'go build -trimpath -o "$engine_dir/skylos-go" ./cmd/skylos-go' in script
-
-
-def test_liveness_primer_workflow_caches_only_the_base_container_image():
-    workflow = _workflow()
-    steps = workflow["jobs"]["blast-radius"]["steps"]
-
-    cache_key = next(
-        step for step in steps if step.get("name") == "Compute base container cache key"
+    assert 'engine_dir="$RUNNER_TEMP/skylos-go-engine"' in script
+    assert '"$engine_dir/skylos-go" --version' in script
+    # The comparison step must hand skylos the engine this step built.
+    comparison = _comparison_step(workflow)
+    assert comparison["env"]["SKYLOS_GO_BIN"] == (
+        "${{ format('{0}/skylos-go-engine/skylos-go', runner.temp) }}"
     )
-    assert cache_key["id"] == "base-container-cache-key"
-    assert cache_key["env"] == {"BASE_SHA": "${{ github.event.pull_request.base.sha }}"}
-    assert "MERGE_SHA" not in cache_key["run"]
-    assert "liveness-primer-base-container-v1-" in cache_key["run"]
-
-    restore = next(
-        step
-        for step in steps
-        if step.get("name") == "Restore cached base container environment"
-    )
-    assert restore["id"] == "base-container-image-cache"
-    assert restore["with"] == {
-        "path": "${{ runner.temp }}/liveness-primer-base-image-cache/base.tar",
-        "key": "${{ steps.base-container-cache-key.outputs.key }}",
-    }
-
-    load = next(
-        step
-        for step in steps
-        if step.get("name") == "Load cached base container environment"
-    )
-    assert load["if"] == "steps.base-container-image-cache.outputs.cache-hit == 'true'"
-    assert 'docker load --input "$IMAGE_ARCHIVE"' in load["run"]
-
-    export = next(
-        step
-        for step in steps
-        if step.get("name") == "Export base container environment after a cache miss"
-    )
-    assert export["id"] == "export-base-container-environment"
-    assert (
-        export["if"]
-        == "always() && steps.base-container-image-cache.outputs.cache-hit != 'true'"
-    )
-    assert ".manifest.base.fingerprint" in export["run"]
-    assert ".manifest.head.fingerprint" not in export["run"]
-    assert 'docker image inspect "$base_image" > /dev/null' in export["run"]
-    assert 'docker save --output "$temporary_archive" "$base_image"' in export["run"]
-
-    save = next(
-        step for step in steps if step.get("name") == "Save base container environment"
-    )
-    assert save["if"] == (
-        "always() && steps.base-container-image-cache.outputs.cache-hit != 'true' "
-        "&& steps.export-base-container-environment.outcome == 'success'"
-    )
-    assert save["with"] == restore["with"]
 
 
 def test_liveness_primer_workflow_uses_locked_comparison_contract():
@@ -378,24 +327,6 @@ engine.write_text("#!/bin/sh\nprintf '%s\\n' 'engine-version-probed' > \"$VERSIO
 engine.chmod(0o700)
 STUB
 }
-docker() {
-  record docker "$@"
-  case "$1 $2" in
-    'version --format')
-      printf '%s\n' "$DOCKER_VERSION"
-      return "$DOCKER_EXIT" ;;
-    'image inspect') return "$INSPECT_EXIT" ;;
-    'load --input') return "$LOAD_EXIT" ;;
-    'save --output')
-      # A failed save can leave a partial archive, which must not be published.
-      printf '%s\n' 'image archive' > "$3"
-      return "$SAVE_EXIT" ;;
-    *) return 99 ;;
-  esac
-}
-sha256sum() {
-  "$WORKFLOW_TEST_PYTHON" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")'
-}
 """
 
 
@@ -405,11 +336,6 @@ def _run_workflow_step(
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("workflow shell checks require bash")
-    if (
-        name == "Export base container environment after a cache miss"
-        and shutil.which("jq") is None
-    ):
-        pytest.skip("container export checks require jq")
     step = next(
         step
         for step in _workflow()["jobs"]["blast-radius"]["steps"]
@@ -423,21 +349,9 @@ def _run_workflow_step(
         "VERSION_PROBE": str(tmp_path / "version probe"),
         "TRUSTED_BASE_SHA": "a" * 40,
         "CHECKOUT_SHA": "a" * 40,
-        "BASE_SHA": "a" * 40,
-        "LIVENESS_PRIMER_REF": "b" * 40,
-        "RUNNER_OS": "Linux",
-        "RUNNER_ARCH": "X64",
-        "DOCKER_VERSION": "28.0.4",
-        "GITHUB_OUTPUT": str(tmp_path / "step output"),
-        "IMAGE_ARCHIVE": str(tmp_path / "image cache" / "base.tar"),
-        "REPORT_JSON": str(tmp_path / "report data.json"),
         "GIT_EXIT": "0",
         "GO_EXIT": "0",
         "ENGINE_EXIT": "0",
-        "DOCKER_EXIT": "0",
-        "INSPECT_EXIT": "0",
-        "LOAD_EXIT": "0",
-        "SAVE_EXIT": "0",
         **(overrides or {}),
     }
     (tmp_path / "_trusted_skylos/skylos/engines/go").mkdir(parents=True, exist_ok=True)
@@ -496,208 +410,3 @@ def test_trusted_go_build_stops_on_failure(
     assert result.returncode == expected_exit, result.stderr
     assert [call[0] for call in _workflow_calls(tmp_path)] == expected_commands
     assert (tmp_path / "version probe").exists() == ("ENGINE_EXIT" in overrides)
-
-
-@pytest.mark.parametrize(
-    "variable,value",
-    [
-        ("BASE_SHA", "c" * 40),
-        ("LIVENESS_PRIMER_REF", "d" * 40),
-        ("RUNNER_OS", "macOS"),
-        ("RUNNER_ARCH", "ARM64"),
-        ("DOCKER_VERSION", "29.0.0"),
-    ],
-)
-def test_container_cache_key_changes_with_identity(
-    tmp_path: Path,
-    variable: str,
-    value: str,
-) -> None:
-    output = tmp_path / "step output"
-    for overrides in ({}, {}, {variable: value}):
-        result = _run_workflow_step(
-            tmp_path, "Compute base container cache key", overrides
-        )
-        assert result.returncode == 0, result.stderr
-    first, repeated, changed = output.read_text().splitlines()
-    assert first.startswith("key=liveness-primer-base-container-v1-")
-    assert first == repeated
-    assert first != changed
-
-
-@pytest.mark.parametrize(
-    "overrides,expected_commands",
-    [
-        ({"BASE_SHA": "main"}, []),
-        ({"LIVENESS_PRIMER_REF": "v0.2.0"}, []),
-        ({"DOCKER_EXIT": "7"}, ["docker"]),
-    ],
-)
-def test_container_cache_key_failure_does_not_publish_output(
-    tmp_path: Path,
-    overrides: dict[str, str],
-    expected_commands: list[str],
-) -> None:
-    result = _run_workflow_step(tmp_path, "Compute base container cache key", overrides)
-    assert result.returncode != 0
-    assert [call[0] for call in _workflow_calls(tmp_path)] == expected_commands
-    assert not (tmp_path / "step output").exists()
-
-
-@pytest.mark.parametrize("load_exit", [0, 7])
-def test_container_cache_load_uses_archive_and_propagates_failure(
-    tmp_path: Path, load_exit: int
-) -> None:
-    archive = tmp_path / "image cache/base.tar"
-    archive.parent.mkdir()
-    archive.write_text("fixture archive")
-    result = _run_workflow_step(
-        tmp_path,
-        "Load cached base container environment",
-        {"LOAD_EXIT": str(load_exit)},
-    )
-    assert result.returncode == load_exit, result.stderr
-    assert _workflow_calls(tmp_path) == [["docker", "load", "--input", str(archive)]]
-
-
-@pytest.mark.parametrize("kind", ["missing", "directory", "symlink"])
-def test_container_cache_load_rejects_unsafe_archive(tmp_path: Path, kind: str) -> None:
-    archive = tmp_path / "image cache/base.tar"
-    archive.parent.mkdir()
-    if kind == "directory":
-        archive.mkdir()
-    elif kind == "symlink":
-        target = tmp_path / "target.tar"
-        target.write_text("fixture archive")
-        archive.symlink_to(target)
-    result = _run_workflow_step(tmp_path, "Load cached base container environment")
-    assert result.returncode != 0
-    assert _workflow_calls(tmp_path) == []
-
-
-def _write_export_report(tmp_path: Path) -> Path:
-    report = tmp_path / "report data.json"
-    report.write_text(
-        json.dumps(
-            {
-                "manifest": {
-                    "isolation_enforced": True,
-                    "comparable": True,
-                    "base": {"fingerprint": "a" * 24},
-                    "head": {"fingerprint": "b" * 24},
-                }
-            }
-        )
-    )
-    return report
-
-
-def test_container_cache_export_publishes_only_base_image(tmp_path: Path) -> None:
-    _write_export_report(tmp_path)
-    result = _run_workflow_step(
-        tmp_path, "Export base container environment after a cache miss"
-    )
-    assert result.returncode == 0, result.stderr
-    archive = tmp_path / "image cache/base.tar"
-    assert _workflow_calls(tmp_path) == [
-        ["docker", "image", "inspect", "liveness-primer/env:" + "a" * 24],
-        [
-            "docker",
-            "save",
-            "--output",
-            str(archive) + ".tmp",
-            "liveness-primer/env:" + "a" * 24,
-        ],
-    ]
-    assert archive.read_text() == "image archive\n"
-    assert not Path(str(archive) + ".tmp").exists()
-
-
-@pytest.mark.parametrize(
-    "state",
-    [
-        "missing",
-        "malformed",
-        "not-isolated",
-        "not-comparable",
-        "missing-fingerprint",
-        "invalid-fingerprint",
-    ],
-)
-def test_container_cache_export_rejects_invalid_report(
-    tmp_path: Path, state: str
-) -> None:
-    report = _write_export_report(tmp_path)
-    data = json.loads(report.read_text())
-    if state == "missing":
-        report.unlink()
-    elif state == "malformed":
-        report.write_text("{")
-    else:
-        if state == "not-isolated":
-            data["manifest"]["isolation_enforced"] = False
-        elif state == "not-comparable":
-            data["manifest"]["comparable"] = False
-        elif state == "missing-fingerprint":
-            del data["manifest"]["base"]["fingerprint"]
-        else:
-            data["manifest"]["base"]["fingerprint"] = "../head"
-        report.write_text(json.dumps(data))
-    result = _run_workflow_step(
-        tmp_path, "Export base container environment after a cache miss"
-    )
-    assert result.returncode != 0
-    assert _workflow_calls(tmp_path) == []
-    assert not (tmp_path / "image cache/base.tar").exists()
-
-
-@pytest.mark.parametrize(
-    "kind",
-    ["directory-symlink", "directory-file", "temporary-file", "temporary-symlink"],
-)
-def test_container_cache_export_rejects_unsafe_paths(tmp_path: Path, kind: str) -> None:
-    _write_export_report(tmp_path)
-    cache_dir = tmp_path / "image cache"
-    target = tmp_path / "untouched"
-    target.mkdir()
-    sentinel = target / "sentinel"
-    sentinel.write_text("unchanged")
-    if kind == "directory-symlink":
-        cache_dir.symlink_to(target, target_is_directory=True)
-    elif kind == "directory-file":
-        cache_dir.write_text("unchanged")
-    else:
-        cache_dir.mkdir()
-        temporary = cache_dir / "base.tar.tmp"
-        if kind == "temporary-file":
-            temporary.write_text("unchanged")
-        else:
-            temporary.symlink_to(sentinel)
-    result = _run_workflow_step(
-        tmp_path, "Export base container environment after a cache miss"
-    )
-    assert result.returncode != 0
-    assert _workflow_calls(tmp_path) == [
-        ["docker", "image", "inspect", "liveness-primer/env:" + "a" * 24]
-    ]
-    assert not (cache_dir / "base.tar").exists()
-    assert sentinel.read_text() == "unchanged"
-
-
-@pytest.mark.parametrize("variable", ["INSPECT_EXIT", "SAVE_EXIT"])
-def test_container_cache_export_failure_does_not_publish_archive(
-    tmp_path: Path, variable: str
-) -> None:
-    _write_export_report(tmp_path)
-    result = _run_workflow_step(
-        tmp_path,
-        "Export base container environment after a cache miss",
-        {variable: "7"},
-    )
-    assert result.returncode == 7, result.stderr
-    calls = _workflow_calls(tmp_path)
-    assert [call[1] for call in calls] == (
-        ["image"] if variable == "INSPECT_EXIT" else ["image", "save"]
-    )
-    assert not (tmp_path / "image cache/base.tar").exists()
-    assert (tmp_path / "image cache/base.tar.tmp").exists() == (variable == "SAVE_EXIT")

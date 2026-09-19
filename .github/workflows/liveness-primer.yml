@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  LIVENESS_PRIMER_REF: 1438a928dd00cbb3b1098a9edc82480f43daabdb
+  LIVENESS_PRIMER_REF: 1438a928dd00cbb3b1098a9edc82480f43daabdb # v0.2.0
 
 concurrency:
   group: liveness-primer-${{ github.event.pull_request.number }}
@@ -74,47 +74,6 @@ jobs:
           python-version: "3.13"
           enable-cache: false
 
-      - name: Compute base container cache key
-        id: base-container-cache-key
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for revision in "$BASE_SHA" "$LIVENESS_PRIMER_REF"; do
-            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Invalid cache-key revision" >&2
-              exit 1
-            fi
-          done
-
-          docker_identity="docker $(docker version --format '{{.Server.Version}}')"
-          docker_hash="$(printf '%s' "$docker_identity" | sha256sum | cut -d ' ' -f 1)"
-          cache_key="liveness-primer-base-container-v1-${RUNNER_OS}-${RUNNER_ARCH}-${docker_hash}-${LIVENESS_PRIMER_REF}-${BASE_SHA}"
-          printf 'key=%s\n' "$cache_key" >> "$GITHUB_OUTPUT"
-
-      - name: Restore cached base container environment
-        id: base-container-image-cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ runner.temp }}/liveness-primer-base-image-cache/base.tar
-          key: ${{ steps.base-container-cache-key.outputs.key }}
-
-      - name: Load cached base container environment
-        if: steps.base-container-image-cache.outputs.cache-hit == 'true'
-        env:
-          IMAGE_ARCHIVE: ${{ runner.temp }}/liveness-primer-base-image-cache/base.tar
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -L "$IMAGE_ARCHIVE" || ! -f "$IMAGE_ARCHIVE" ]]; then
-            echo "Cached container archive is not a regular file" >&2
-            exit 1
-          fi
-          docker load --input "$IMAGE_ARCHIVE"
-
       - name: Compare base with the pull request merge result
         env:
           SKYLOS_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
@@ -148,48 +107,6 @@ jobs:
             | tee "$REPORT_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
 
           test -s "$REPORT_JSON"
-
-      - name: Export base container environment after a cache miss
-        id: export-base-container-environment
-        if: always() && steps.base-container-image-cache.outputs.cache-hit != 'true'
-        env:
-          IMAGE_ARCHIVE: ${{ runner.temp }}/liveness-primer-base-image-cache/base.tar
-          REPORT_JSON: liveness-primer-report.json
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          jq -e '.manifest.isolation_enforced == true and .manifest.comparable == true' "$REPORT_JSON" > /dev/null
-          base_fingerprint="$(jq -er '.manifest.base.fingerprint | select(test("^[0-9a-f]{24}$"))' "$REPORT_JSON")"
-          base_image="liveness-primer/env:${base_fingerprint}"
-
-          docker image inspect "$base_image" > /dev/null
-
-          cache_dir="$(dirname "$IMAGE_ARCHIVE")"
-          if [[ -L "$cache_dir" || ( -e "$cache_dir" && ! -d "$cache_dir" ) ]]; then
-            echo "Container cache path is not a regular directory" >&2
-            exit 1
-          fi
-          mkdir -p "$cache_dir"
-          if [[ -L "$cache_dir" || ! -d "$cache_dir" ]]; then
-            echo "Container cache path is not a regular directory" >&2
-            exit 1
-          fi
-
-          temporary_archive="${IMAGE_ARCHIVE}.tmp"
-          if [[ -e "$temporary_archive" || -L "$temporary_archive" ]]; then
-            echo "Temporary container archive path already exists" >&2
-            exit 1
-          fi
-          docker save --output "$temporary_archive" "$base_image"
-          mv "$temporary_archive" "$IMAGE_ARCHIVE"
-
-      - name: Save base container environment
-        if: always() && steps.base-container-image-cache.outputs.cache-hit != 'true' && steps.export-base-container-environment.outcome == 'success'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ runner.temp }}/liveness-primer-base-image-cache/base.tar
-          key: ${{ steps.base-container-cache-key.outputs.key }}
 
       - name: Upload blast-radius evidence
         if: always()
