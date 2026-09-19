@@ -30,7 +30,7 @@
 ## What Is Skylos?
 
 Skylos is an open-source static analysis CLI for Python, TypeScript,
-JavaScript, Java, Go, Kotlin, PHP, Rust, Dart, C#, Shell, and deployment config. It
+JavaScript, Java, Go, Kotlin, PHP, Rust, Dart, C#, C++, Shell, and deployment config. It
 runs locally by default and can also be used as a CI/CD PR gate.
 
 Use Skylos when you want one command to check a repo or pull request for:
@@ -140,7 +140,8 @@ Need more commands? Read the [CLI Reference](https://docs.skylos.dev/cli-referen
 | PR gate | `skylos cicd init` | Generates a GitHub Actions workflow with annotations and failure thresholds | [CI/CD guide](https://docs.skylos.dev/ci-cd) |
 | GitLab merge request report | `skylos . --format gitlab -o gl-code-quality-report.json` | Exports a native Code Quality report for GitLab CI artifacts | [GitLab Code Quality](./docs/gitlab-code-quality.md) |
 | Offline dependency SBOM | `skylos sbom . -o sbom.cdx.json` | Lists supported recorded dependencies as CycloneDX 1.6 JSON without network requests | [Dependency scanning](./docs/dependency-scanning.md#export-an-sbom-offline) |
-| Container-image report import | `skylos ingest trivy --input trivy.json --sarif image.sarif` | Converts an existing Trivy image vulnerability report to Skylos JSON/SARIF; optional digest-bound severity check | [Container-image reports](./docs/container-image-reports.md) |
+| Container-image scan | `skylos image scan IMAGE@sha256:<digest> --platform linux/amd64 --fail-on high` | Runs an installed Trivy scanner for a pinned image, then reports vulnerabilities and checks severity | [Container-image scanning](./docs/container-image-reports.md) |
+| Container-image report import | `skylos ingest trivy --input trivy.json --sarif image.sarif` | Converts an existing Trivy image vulnerability report to Skylos JSON/SARIF; optional digest-bound severity check | [Container-image scanning](./docs/container-image-reports.md#import-an-existing-trivy-report) |
 | Readable terminal report | `skylos . --format pretty` | Groups findings by file with severity badges, snippets, and copyable `file:line` locations | [CLI output modes](./docs/cli-output.md) |
 | Single-rule review | `skylos . --select SKY-L012 --format concise` | Enables the matching analyzer family and reports only that exact rule with its full message | [CLI output modes](./docs/cli-output.md) |
 | Selectable terminal triage | `skylos . --tui` | Opens a keyboard-driven category list, finding list, and detail pane | [CLI output modes](./docs/cli-output.md) |
@@ -442,6 +443,7 @@ or `--include-folder` to override an excluded folder.
 | Rust | Yes | Yes | Partial | Unsupported | Rust parser coverage plus security sink/source checks |
 | Dart | Yes | Yes | Partial | Unsupported | Dart parser coverage plus selected security sinks and sources |
 | C# | Yes | Yes | Partial | Unsupported | C# symbol coverage plus selected ASP.NET, process, SQL, HTTP, and file sinks |
+| C++ | Partial | No | No | Unsupported | conservative unused file-local functions in `.cpp`, `.cc`, `.cxx`; C++ headers are parsed for references |
 | Kotlin | Yes | Partial | Partial | Unsupported | Kotlin symbol extraction with conservative static-analysis coverage |
 | Shell | No | Yes | Partial | Unsupported | shell-script security checks for command injection, SSRF, and path traversal |
 
@@ -451,6 +453,12 @@ names under a verified local source root. Helper reads are bounded and reject
 symlinks; no Java code or build scripts are executed. This is not full classpath
 or recursive helper analysis. Unknown helpers are not assumed to be request
 sources or sanitizers.
+
+C++ analysis covers `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, and `.hxx`. The first
+release reports only apparently unused file-local free functions. Without a
+build configuration, it cannot fully resolve templates, overloads, macros, or
+external usage; these findings are a conservative heuristic, not a proof of
+C++ deadness. Ambiguous `.h` files and C files are not analyzed as C++.
 
 Java weak-hash checks also follow local algorithm variables and values loaded
 through `java.util.Properties` from literal classloader resources. Resource
@@ -570,7 +578,7 @@ A local Astronomer scan on April 26, 2026 computed 420 stargazers and returned
 
 | Integration | Link | Purpose |
 |:---|:---|:---|
-| GitHub Action | [GitHub Action](./action.yml) | PR gates, annotations, and CI enforcement |
+| GitHub Action | [GitHub Action](./action.yml) | Repository PR gates or optional digest-pinned container-image gates |
 | GitLab Code Quality | [GitLab setup](./docs/gitlab-code-quality.md) | merge request report artifacts; no comment-posting bot or API token |
 | VS Code extension | [VS Code extension](./editors/vscode/README.md) | in-editor findings and AI-assisted fixes |
 | MCP server | [MCP setup](https://docs.skylos.dev/mcp-server) | expose Skylos scans to AI agents and coding assistants |
@@ -585,8 +593,15 @@ skylos cicd init --upload
 skylos cicd init --upload --scan-path apps/api
 ```
 
-The generated upload workflow uses GitHub OIDC, sends PR head commit/branch
-metadata, and supports monorepo subprojects through `--scan-path`.
+The generated workflow reviews changed lines on pull requests and uploads full
+scans on pushes using GitHub OIDC. It supports monorepo subprojects through
+`--scan-path`.
+
+To scan a built image with the composite Action, install a pinned Trivy version
+in the caller's job and set `image` to a trusted `repository@sha256:<digest>`
+build output plus `image-platform`. This runs an image-only scan; `mode: gate`
+uses `image-fail-on` (default `high`), while `mode: scan` only reports findings.
+See [container-image scanning](./docs/container-image-reports.md#scan-an-image-with-the-github-action).
 
 ## Documentation Map
 
@@ -602,6 +617,7 @@ metadata, and supports monorepo subprojects through `--scan-path`.
 | Dead-code behavior and framework awareness | [Dead Code Detection](https://docs.skylos.dev/dead-code-detection) |
 | Security scanning and taint analysis | [Security Analysis](https://docs.skylos.dev/security-analysis) |
 | Dependency CVEs, uv/npm/pnpm/Poetry/Yarn lockfiles, offline SBOM, and SCA in CI | [Dependency Scanning](./docs/dependency-scanning.md) |
+| Digest-pinned container-image scanning and GitHub Action setup | [Container-image scanning](./docs/container-image-reports.md) |
 | Rule ID prefixes and product terminology | [Rule Dictionary](./dictionary.md) |
 | Agent scan, verification, remediation, and model setup | [AI Features](https://docs.skylos.dev/ai-features) |
 | AI defense checks and LLM guardrails | [AI Defense](https://docs.skylos.dev/ai-defense) |

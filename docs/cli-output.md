@@ -16,6 +16,7 @@ Skylos keeps the default terminal output stable for existing scripts and copy/pa
 | Compact human report | `skylos . --format pretty` | Quick local review and PR discussion |
 | Copyable plain output | `skylos . --format concise` | CI logs, scripts, editors, and automation |
 | Machine-readable results | `skylos . --format json` | Programmatic use and external integrations |
+| Smaller machine-readable results | `skylos . --format json-ci` | CI jobs and agents that need findings without the full symbol inventory |
 | AI-ready report | `skylos . --format llm` | Agent workflows and structured reasoning systems |
 | GitHub Actions annotations | `skylos . --format github` | Inline workflow annotations in GitHub checks |
 | GitLab Code Quality report | `skylos . --format gitlab -o gl-code-quality-report.json` | Findings in GitLab merge request reports |
@@ -102,13 +103,19 @@ Example:
 src/app.py:42  SKY-L012  Call to 'security.require_auth()' resolves to no definition on local modules.
 ```
 
-Use `json`, `llm`, or `github` for structured consumers:
+Use `json`, `json-ci`, `llm`, or `github` for structured consumers:
 
 ```bash
 skylos . --format json
+skylos . --format json-ci
 skylos . --format llm
 skylos . --format github
 ```
+
+`json-ci` keeps the same findings, per-finding evidence, and summary counts as
+`json`. It omits only the top-level `dead_code_evidence` ledger and
+`definitions` map, which can make a full scan report large. Use `json` when
+you need those full symbol details; its output is unchanged.
 
 Use `gitlab` to save a GitLab Code Quality JSON array:
 
@@ -177,6 +184,21 @@ analysis phases will not execute. A selected report omits the aggregate grade,
 because that grade describes the unfiltered scan. Analysis errors remain
 visible regardless of selection and still exit with code 2, preventing an
 incomplete scan from appearing clean.
+
+## Review Changed Lines
+
+`skylos . --diff origin/main --format json` analyzes the selected project for
+context and reports code findings on changed lines. Use `--diff-base origin/main`
+to report findings anywhere in changed files instead. A valid diff with no
+changed lines or files has no diff findings. An unavailable base ref exits with
+status 2 instead of returning the full scan as a PR result. Both scoped reports
+omit the full-project grade, which would describe findings that are not shown.
+The JSON `definitions` and `dead_code_evidence` fields retain full-project
+analysis context; the finding lists and their summary counts are scoped.
+Diff-scoped reports cannot be combined with `--upload`, because Cloud treats
+uploaded scans as full-project results. Run a separate full scan to upload.
+Removing a call can make an unchanged function dead; neither diff mode currently
+reports that function unless its definition is also in the selected scope.
 
 ## Selectable Terminal UI
 
