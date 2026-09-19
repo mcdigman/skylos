@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  LIVENESS_PRIMER_REF: 4d6ac9c6d5a5b09a013a6820256d4749a008e7c0 # PR #41
+  LIVENESS_PRIMER_REF: 50745935b858698e12c4ee5dfb7c9cef6450784b # main
 
 concurrency:
   group: liveness-primer-${{ github.event.pull_request.number }}

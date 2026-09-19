@@ -76,7 +76,7 @@ def test_liveness_primer_workflow_pins_actions_and_toolchain():
         assert all(character in "0123456789abcdef" for character in action_ref)
 
     assert workflow["env"] == {
-        "LIVENESS_PRIMER_REF": "4d6ac9c6d5a5b09a013a6820256d4749a008e7c0"
+        "LIVENESS_PRIMER_REF": "50745935b858698e12c4ee5dfb7c9cef6450784b"
     }
 
     trusted_checkout = next(
