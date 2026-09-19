@@ -1,15 +1,14 @@
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
 
 from skylos.rules.config.cicd.github_actions import scan_github_actions_file
-
 
 WORKFLOW_PATH = Path(".github/workflows/liveness-primer.yml")
 
@@ -64,24 +63,43 @@ def test_liveness_primer_workflow_pins_actions_and_toolchain():
     action_steps = [step for step in steps if "uses" in step]
 
     assert {step["uses"] for step in action_steps} == {
-        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
-        "astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f",
-        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae",
+        "actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
     }
     for step in action_steps:
         action_ref = step["uses"].split("@", 1)[1]
         assert len(action_ref) == 40
         assert all(character in "0123456789abcdef" for character in action_ref)
 
-    checkout = next(
+    assert workflow["env"] == {
+        "LIVENESS_PRIMER_REF": "1438a928dd00cbb3b1098a9edc82480f43daabdb"
+    }
+
+    trusted_checkout = next(
+        step for step in steps if step.get("name") == "Check out trusted Skylos base"
+    )
+    assert trusted_checkout["with"] == {
+        "ref": "${{ github.event.pull_request.base.sha }}",
+        "path": "_trusted_skylos",
+        "persist-credentials": False,
+    }
+
+    primer_checkout = next(
         step for step in steps if step.get("name") == "Check out pinned liveness_primer"
     )
-    assert checkout["with"] == {
+    assert primer_checkout["with"] == {
         "repository": "mcdigman/liveness_primer",
-        "ref": "d6f3118a2cfc465426500eab449005fe56845c58",
+        "ref": "${{ env.LIVENESS_PRIMER_REF }}",
         "path": "_liveness_primer",
         "persist-credentials": False,
     }
+
+    setup_go = next(step for step in steps if step.get("name") == "Install Go")
+    assert setup_go["with"] == {"go-version": "1.22", "cache": False}
 
     setup_uv = next(step for step in steps if step.get("name") == "Install uv")
     assert setup_uv["with"] == {
@@ -91,11 +109,91 @@ def test_liveness_primer_workflow_pins_actions_and_toolchain():
     }
 
 
+def test_liveness_primer_workflow_builds_trusted_base_go_engine():
+    workflow = _workflow()
+    steps = workflow["jobs"]["blast-radius"]["steps"]
+    build = next(
+        step for step in steps if step.get("name") == "Build trusted base Go engine"
+    )
+
+    assert build["env"] == {
+        "TRUSTED_BASE_SHA": "${{ github.event.pull_request.base.sha }}"
+    }
+    assert build["shell"] == "bash"
+    script = build["run"]
+    assert '[[ ! "$TRUSTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]' in script
+    assert "git -C _trusted_skylos rev-parse HEAD" in script
+    assert '[[ "$trusted_checkout_sha" != "$TRUSTED_BASE_SHA" ]]' in script
+    assert "cd _trusted_skylos/skylos/engines/go" in script
+    assert 'go build -trimpath -o "$engine_dir/skylos-go" ./cmd/skylos-go' in script
+
+
+def test_liveness_primer_workflow_caches_only_the_base_container_image():
+    workflow = _workflow()
+    steps = workflow["jobs"]["blast-radius"]["steps"]
+
+    cache_key = next(
+        step for step in steps if step.get("name") == "Compute base container cache key"
+    )
+    assert cache_key["id"] == "base-container-cache-key"
+    assert cache_key["env"] == {
+        "BASE_SHA": "${{ github.event.pull_request.base.sha }}"
+    }
+    assert "MERGE_SHA" not in cache_key["run"]
+    assert "liveness-primer-base-container-v1-" in cache_key["run"]
+
+    restore = next(
+        step
+        for step in steps
+        if step.get("name") == "Restore cached base container environment"
+    )
+    assert restore["id"] == "base-container-image-cache"
+    assert restore["with"] == {
+        "path": "${{ runner.temp }}/liveness-primer-base-image-cache/base.tar",
+        "key": "${{ steps.base-container-cache-key.outputs.key }}",
+    }
+
+    load = next(
+        step
+        for step in steps
+        if step.get("name") == "Load cached base container environment"
+    )
+    assert load["if"] == "steps.base-container-image-cache.outputs.cache-hit == 'true'"
+    assert 'docker load --input "$IMAGE_ARCHIVE"' in load["run"]
+
+    export = next(
+        step
+        for step in steps
+        if step.get("name") == "Export base container environment after a cache miss"
+    )
+    assert export["id"] == "export-base-container-environment"
+    assert (
+        export["if"]
+        == "always() && steps.base-container-image-cache.outputs.cache-hit != 'true'"
+    )
+    assert ".manifest.base.fingerprint" in export["run"]
+    assert ".manifest.head.fingerprint" not in export["run"]
+    assert 'docker image inspect "$base_image" > /dev/null' in export["run"]
+    assert 'docker save --output "$temporary_archive" "$base_image"' in export["run"]
+
+    save = next(
+        step for step in steps if step.get("name") == "Save base container environment"
+    )
+    assert save["if"] == (
+        "always() && steps.base-container-image-cache.outputs.cache-hit != 'true' "
+        "&& steps.export-base-container-environment.outcome == 'success'"
+    )
+    assert save["with"] == restore["with"]
+
+
 def test_liveness_primer_workflow_uses_locked_comparison_contract():
     workflow = _workflow()
     comparison = _comparison_step(workflow)
     assert comparison["env"] == {
-        "SKYLOS_REPOSITORY": "https://github.com/duriantaco/skylos",
+        "SKYLOS_REPOSITORY": "${{ github.server_url }}/${{ github.repository }}",
+        "SKYLOS_GO_BIN": (
+            "${{ format('{0}/skylos-go-engine/skylos-go', runner.temp) }}"
+        ),
         "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
         "MERGE_SHA": "${{ github.sha }}",
         "REPORT_JSON": "liveness-primer-report.json",
@@ -109,6 +207,7 @@ def test_liveness_primer_workflow_uses_locked_comparison_contract():
     assert '--repo "$SKYLOS_REPOSITORY"' in script
     assert '--old "$BASE_SHA"' in script
     assert '--new "$MERGE_SHA"' in script
+    assert "--container" in script
     assert "--output github" in script
     assert '--json-out "$REPORT_JSON"' in script
     assert "--jobs 2" in script
@@ -215,6 +314,7 @@ def test_comparison_shell_passes_exact_revisions_and_keeps_both_reports(tmp_path
         "--new",
         "b" * 40,
         "--all",
+        "--container",
         "--output",
         "github",
         "--json-out",
