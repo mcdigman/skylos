@@ -128,6 +128,64 @@ def test_liveness_primer_workflow_builds_trusted_base_go_engine():
     assert 'go build -trimpath -o "$engine_dir/skylos-go" ./cmd/skylos-go' in script
 
 
+def test_liveness_primer_workflow_caches_only_the_base_container_image():
+    workflow = _workflow()
+    steps = workflow["jobs"]["blast-radius"]["steps"]
+
+    cache_key = next(
+        step for step in steps if step.get("name") == "Compute base container cache key"
+    )
+    assert cache_key["id"] == "base-container-cache-key"
+    assert cache_key["env"] == {
+        "BASE_SHA": "${{ github.event.pull_request.base.sha }}"
+    }
+    assert "MERGE_SHA" not in cache_key["run"]
+    assert "liveness-primer-base-container-v1-" in cache_key["run"]
+
+    restore = next(
+        step
+        for step in steps
+        if step.get("name") == "Restore cached base container environment"
+    )
+    assert restore["id"] == "base-container-image-cache"
+    assert restore["with"] == {
+        "path": "${{ runner.temp }}/liveness-primer-base-image-cache/base.tar",
+        "key": "${{ steps.base-container-cache-key.outputs.key }}",
+    }
+
+    load = next(
+        step
+        for step in steps
+        if step.get("name") == "Load cached base container environment"
+    )
+    assert load["if"] == "steps.base-container-image-cache.outputs.cache-hit == 'true'"
+    assert 'docker load --input "$IMAGE_ARCHIVE"' in load["run"]
+
+    export = next(
+        step
+        for step in steps
+        if step.get("name") == "Export base container environment after a cache miss"
+    )
+    assert export["id"] == "export-base-container-environment"
+    assert (
+        export["if"]
+        == "always() && steps.base-container-image-cache.outputs.cache-hit != 'true'"
+    )
+    assert ".manifest.base.fingerprint" in export["run"]
+    assert ".manifest.head.fingerprint" not in export["run"]
+    assert 'docker image inspect "$base_image" > /dev/null' in export["run"]
+    assert 'docker save --output "$temporary_archive" "$base_image"' in export["run"]
+
+    save = next(
+        step for step in steps if step.get("name") == "Save base container environment"
+    )
+    assert save["if"] == (
+        "always() && steps.base-container-image-cache.outputs.cache-hit != 'true' "
+        "&& steps.export-base-container-environment.outcome == 'success'"
+    )
+    assert save["with"] == restore["with"]
+
+
 def test_liveness_primer_workflow_uses_locked_comparison_contract():
     workflow = _workflow()
     comparison = _comparison_step(workflow)
